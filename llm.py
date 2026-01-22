@@ -44,19 +44,85 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
-# --- bootstrap aiohttp (self-install) ---
+# --- bootstrap aiohttp (self-install via local .venv to avoid PEP 668) ---
 def _ensure_aiohttp():
+    """
+    If aiohttp isn't available:
+      1) Prefer installing into an existing active venv, if we're already in one.
+      2) Otherwise, create ./\.venv next to this script, install aiohttp there,
+         then re-exec this script under the venv interpreter.
+
+    This avoids Debian/Ubuntu "externally-managed-environment" (PEP 668).
+    """
     try:
-        import aiohttp  # noqa
-        from aiohttp import web  # noqa
+        import aiohttp  # noqa: F401
+        from aiohttp import web  # noqa: F401
         return
     except Exception:
         pass
+
     import subprocess
-    print("[bootstrap] Installing aiohttp ...", file=sys.stderr)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "aiohttp>=3.9.0"])
-    import aiohttp  # noqa
-    from aiohttp import web  # noqa
+    import pathlib
+
+    # Detect whether we're already inside a virtualenv
+    in_venv = (getattr(sys, "base_prefix", sys.prefix) != sys.prefix) or bool(os.environ.get("VIRTUAL_ENV"))
+
+    req_spec = "aiohttp>=3.9.0"
+
+    def _run(cmd: list[str]) -> None:
+        subprocess.check_call(cmd)
+
+    def _try_install_in_current_python():
+        # If pip is missing in this interpreter, try ensurepip
+        try:
+            _run([sys.executable, "-m", "pip", "--version"])
+        except Exception:
+            try:
+                _run([sys.executable, "-m", "ensurepip", "--upgrade"])
+            except Exception:
+                pass
+        _run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"])
+        _run([sys.executable, "-m", "pip", "install", "-q", req_spec])
+
+    if in_venv:
+        print("[bootstrap] Installing aiohttp into active virtualenv...", file=sys.stderr)
+        _try_install_in_current_python()
+        import aiohttp  # noqa: F401
+        from aiohttp import web  # noqa: F401
+        return
+
+    # Not in a venv: create/use .venv next to this script
+    script_dir = pathlib.Path(__file__).resolve().parent
+    venv_dir = script_dir / ".venv"
+
+    if os.name == "nt":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+
+    try:
+        if not venv_python.exists():
+            print(f"[bootstrap] Creating virtualenv at: {venv_dir}", file=sys.stderr)
+            _run([sys.executable, "-m", "venv", str(venv_dir)])
+
+        print("[bootstrap] Installing aiohttp into .venv...", file=sys.stderr)
+        _run([str(venv_python), "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"])
+        _run([str(venv_python), "-m", "pip", "install", "-q", req_spec])
+
+        # Re-exec under venv python
+        print("[bootstrap] Re-launching under .venv interpreter...", file=sys.stderr)
+        os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+    except subprocess.CalledProcessError as e:
+        # Most common: python3-venv not installed (Debian/Ubuntu)
+        msg = (
+            "[bootstrap] Failed to create/use .venv automatically.\n"
+            "On Debian/Ubuntu you likely need the venv package installed:\n"
+            "  sudo apt-get install -y python3-venv\n"
+            "Then re-run:\n"
+            "  python3 chat.py --bind 0.0.0.0 --port 0 --upnp\n"
+        )
+        raise RuntimeError(msg) from e
 
 _ensure_aiohttp()
 import aiohttp
