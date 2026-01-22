@@ -1,67 +1,86 @@
 #!/usr/bin/env python3
 """
-UPnP-exposed, auth-gated Ollama chat portal (single-file, Python 3 stdlib):
-- UPnP IGD port mapping (optional) to expose public HTTP endpoint
-- SQLite user DB (signup/login) + server session tokens
-- Token stored client-side (localStorage)
-- Chat sessions/messages stored client-side (IndexedDB) for persistence across visits
-- Mobile-first dark UI w/ slide-out sidebar, accent #ffae00, 8px radius, monospace
-- Proxies a SAFE allowlist of Ollama endpoints (streaming where applicable):
-    GET  /api/tags        -> /ollama/tags
-    GET  /api/version     -> /ollama/version
-    POST /api/chat        -> /ollama/chat      (NDJSON streaming)
-    POST /api/generate    -> /ollama/generate  (NDJSON streaming)
-    POST /api/embeddings  -> /ollama/embeddings
+Ollama Mobile Chat (single-file)
+- Mobile-first chat UI (dark grey/black, accent #ffae00, 8px radius, monospace)
+- Local auth (SQLite) with token stored in localStorage (client)
+- Client-side persistence via IndexedDB (sessions + messages)
+- Model capability detection:
+    - /api/tags then /api/show to fetch capabilities
+    - Show "thinking" controls only for models with capability "thinking"
+    - Show image upload only for models with capability "vision"
+- Safe Ollama proxy:
+    - /api/chat (streaming NDJSON)
+    - /api/generate (streaming NDJSON)
+    - /api/embed
+    - /api/tags, /api/show
+- UPnP IGD mapping:
+    - Random external port forwarded to local server port (no manual port forwarding)
 
-NOT exposed: pull/delete/create/copy/push/etc.
+Run:
+  python3 chat.py --bind 0.0.0.0 --port 0 --upnp
+Then open:
+  Local:  http://127.0.0.1:<localport>/
+  Public: http://<router-external-ip>:<random-external-port>/
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
+import asyncio
+import base64
 import datetime as _dt
 import hashlib
 import hmac
-import http.client
 import json
+import os
 import random
 import secrets
 import socket
 import sqlite3
-import threading
+import sys
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+# --- bootstrap aiohttp (self-install) ---
+def _ensure_aiohttp():
+    try:
+        import aiohttp  # noqa
+        from aiohttp import web  # noqa
+        return
+    except Exception:
+        pass
+    import subprocess
+    print("[bootstrap] Installing aiohttp ...", file=sys.stderr)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "aiohttp>=3.9.0"])
+    import aiohttp  # noqa
+    from aiohttp import web  # noqa
 
-# ==========================
-# Config / constants
-# ==========================
+_ensure_aiohttp()
+import aiohttp
+from aiohttp import web
 
-USER_AGENT = "python-upnp-ollama-portal/2.1"
-DEFAULT_MAX_BODY = 12 * 1024 * 1024  # 12MB
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://127.0.0.1:11434").rstrip("/")
+DB_PATH = os.environ.get("APP_DB", "ollama_mobile_chat.sqlite3")
 
+MODELS_CACHE_TTL_SEC = 20
+SHOW_CACHE_TTL_SEC = 60
+
+MAX_JSON_BODY = 2_000_000
+MAX_IMAGE_B64_BYTES = 10_000_000
+
+# =========================
+# UPnP IGD (SSDP + SOAP)
+# =========================
+
+USER_AGENT = "python-upnp-ollama-chat/1.0"
 SSDP_ADDR = ("239.255.255.250", 1900)
 SSDP_ST = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
 
-ALLOWED_OLLAMA = {
-    ("GET", "/api/tags"),
-    ("GET", "/api/version"),
-    ("POST", "/api/chat"),
-    ("POST", "/api/generate"),
-    ("POST", "/api/embeddings"),
-}
-
-DB_LOCK = threading.Lock()
-
-
-def now_human() -> str:
+def _now() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 def get_local_ip() -> str:
     try:
@@ -72,19 +91,6 @@ def get_local_ip() -> str:
         return ip
     except Exception:
         return socket.gethostbyname(socket.gethostname())
-
-
-def pick_free_port(bind_host: str) -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind((bind_host, 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-# ==========================
-# UPnP IGD helpers
-# ==========================
 
 def ssdp_discover(timeout: float = 3.0) -> Optional[str]:
     msg = "\r\n".join([
@@ -120,12 +126,10 @@ def ssdp_discover(timeout: float = 3.0) -> Optional[str]:
         sock.close()
     return None
 
-
 def http_get(url: str, timeout: float = 6.0) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
-
 
 def find_igd_control_url(device_desc_url: str) -> Tuple[Optional[str], Optional[str]]:
     raw = http_get(device_desc_url)
@@ -166,7 +170,6 @@ def find_igd_control_url(device_desc_url: str) -> Tuple[Optional[str], Optional[
 
     return None, None
 
-
 def escape_xml(s: str) -> str:
     return (
         s.replace("&", "&amp;")
@@ -175,7 +178,6 @@ def escape_xml(s: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
-
 
 def soap_call(control_url: str, service_type: str, action: str, body_xml: str, timeout: float = 8.0) -> bytes:
     envelope = f"""<?xml version="1.0"?>
@@ -198,7 +200,6 @@ def soap_call(control_url: str, service_type: str, action: str, body_xml: str, t
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
-
 def get_external_ip(control_url: str, service_type: str) -> Optional[str]:
     resp = soap_call(control_url, service_type, "GetExternalIPAddress", "")
     xml = ET.fromstring(resp)
@@ -206,7 +207,6 @@ def get_external_ip(control_url: str, service_type: str) -> Optional[str]:
         if el.tag.endswith("NewExternalIPAddress") and el.text:
             return el.text.strip()
     return None
-
 
 def add_port_mapping(control_url: str, service_type: str, external_port: int, internal_ip: str,
                      internal_port: int, desc: str, lease_seconds: int = 0) -> None:
@@ -222,7 +222,6 @@ def add_port_mapping(control_url: str, service_type: str, external_port: int, in
 """.strip()
     soap_call(control_url, service_type, "AddPortMapping", body)
 
-
 def delete_port_mapping(control_url: str, service_type: str, external_port: int) -> None:
     body = f"""
 <NewRemoteHost></NewRemoteHost>
@@ -231,507 +230,574 @@ def delete_port_mapping(control_url: str, service_type: str, external_port: int)
 """.strip()
     soap_call(control_url, service_type, "DeletePortMapping", body)
 
-
-# ==========================
+# =========================
 # Auth DB (SQLite)
-# ==========================
+# =========================
 
-def db_connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    with conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          username TEXT UNIQUE NOT NULL,
-          salt BLOB NOT NULL,
-          pw_hash BLOB NOT NULL,
-          created_at INTEGER NOT NULL
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-          token TEXT PRIMARY KEY,
-          user_id INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          last_seen INTEGER NOT NULL,
-          expires_at INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """)
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+DB = db_connect()
 
-def pbkdf2_hash(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+def db_init() -> None:
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      pw_hash BLOB NOT NULL,
+      salt BLOB NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    """)
+    DB.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+    DB.commit()
 
+def _pbkdf2(password: str, salt: bytes, iters: int = 200_000) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, dklen=32)
 
-def create_user(conn: sqlite3.Connection, username: str, password: str) -> None:
+def create_user(username: str, password: str) -> None:
     username = username.strip()
-    if not username or len(username) > 40:
-        raise ValueError("invalid_username")
-    if len(password) < 10:
-        raise ValueError("password_too_short")
+    if not username or len(username) < 3:
+        raise ValueError("Username too short.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 chars.")
     salt = secrets.token_bytes(16)
-    pw_hash = pbkdf2_hash(password, salt)
-    with DB_LOCK, conn:
-        conn.execute(
-            "INSERT INTO users (username, salt, pw_hash, created_at) VALUES (?,?,?,?)",
-            (username, salt, pw_hash, int(time.time()))
+    pw_hash = _pbkdf2(password, salt)
+    try:
+        DB.execute(
+            "INSERT INTO users(username, pw_hash, salt, created_at) VALUES(?,?,?,?)",
+            (username, pw_hash, salt, int(time.time())),
         )
+        DB.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError("Username already exists.")
 
-
-def verify_user(conn: sqlite3.Connection, username: str, password: str) -> Optional[int]:
-    with DB_LOCK:
-        row = conn.execute("SELECT id, salt, pw_hash FROM users WHERE username = ?", (username.strip(),)).fetchone()
+def verify_user(username: str, password: str) -> Optional[int]:
+    row = DB.execute("SELECT id, pw_hash, salt FROM users WHERE username = ?", (username.strip(),)).fetchone()
     if not row:
         return None
-    salt = bytes(row["salt"])
-    expected = bytes(row["pw_hash"])
-    got = pbkdf2_hash(password, salt)
-    if hmac.compare_digest(got, expected):
-        return int(row["id"])
+    uid, pw_hash, salt = row
+    cand = _pbkdf2(password, salt)
+    if hmac.compare_digest(pw_hash, cand):
+        return int(uid)
     return None
 
-
-def new_session(conn: sqlite3.Connection, user_id: int, ttl_seconds: int = 7 * 24 * 3600) -> str:
+def new_session_token(uid: int, ttl: int = 7 * 24 * 3600) -> str:
     token = secrets.token_urlsafe(32)
     now = int(time.time())
-    expires = now + ttl_seconds
-    with DB_LOCK, conn:
-        conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, last_seen, expires_at) VALUES (?,?,?,?,?)",
-            (token, user_id, now, now, expires)
-        )
+    DB.execute(
+        "INSERT INTO sessions(token, user_id, created_at, last_seen, expires_at) VALUES(?,?,?,?,?)",
+        (token, uid, now, now, now + ttl),
+    )
+    DB.commit()
     return token
 
-
-def get_session(conn: sqlite3.Connection, token: str) -> Optional[sqlite3.Row]:
+def get_user_by_token(token: str) -> Optional[Tuple[int, str]]:
     if not token:
         return None
     now = int(time.time())
-    with DB_LOCK:
-        row = conn.execute(
-            """SELECT s.token, s.user_id, s.expires_at, u.username
-               FROM sessions s JOIN users u ON u.id = s.user_id
-               WHERE s.token = ?""",
-            (token,)
-        ).fetchone()
+    row = DB.execute(
+        "SELECT u.id, u.username, s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
+        (token,),
+    ).fetchone()
     if not row:
         return None
-    if int(row["expires_at"]) < now:
-        with DB_LOCK, conn:
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    uid, username, expires_at = row
+    if int(expires_at) < now:
+        DB.execute("DELETE FROM sessions WHERE token=?", (token,))
+        DB.commit()
         return None
-    with DB_LOCK, conn:
-        conn.execute("UPDATE sessions SET last_seen = ? WHERE token = ?", (now, token))
-    return row
+    DB.execute("UPDATE sessions SET last_seen=? WHERE token=?", (now, token))
+    DB.commit()
+    return int(uid), str(username)
 
+# =========================
+# Ollama proxy + capability cache
+# =========================
 
-def delete_session(conn: sqlite3.Connection, token: str) -> None:
-    with DB_LOCK, conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+_models_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+_show_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
+async def ollama_fetch_json(session: aiohttp.ClientSession, method: str, path: str, payload: Any = None) -> Dict[str, Any]:
+    url = f"{OLLAMA_BASE}{path}"
+    kwargs = {}
+    if payload is not None:
+        kwargs["json"] = payload
+    async with session.request(method, url, **kwargs, timeout=None) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            try:
+                j = json.loads(text) if text else {}
+            except Exception:
+                j = {"error": text}
+            raise web.HTTPBadRequest(text=json.dumps({"error": j.get("error", f"Ollama error {resp.status}")}),
+                                     content_type="application/json")
+        return json.loads(text) if text else {}
 
-# ==========================
-# Ollama proxy
-# ==========================
+async def ollama_get_show(session: aiohttp.ClientSession, model: str) -> Dict[str, Any]:
+    now = time.time()
+    cached = _show_cache.get(model)
+    if cached and (now - cached[0]) < SHOW_CACHE_TTL_SEC:
+        return cached[1]
+    data = await ollama_fetch_json(session, "POST", "/api/show", {"model": model})
+    _show_cache[model] = (now, data)
+    return data
 
-def parse_ollama_base(url: str) -> Tuple[str, int, str]:
-    u = urllib.parse.urlparse(url)
-    scheme = u.scheme or "http"
-    if scheme != "http":
-        raise ValueError("Only http:// Ollama base supported.")
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 11434
-    return host, port, scheme
+async def get_models_with_capabilities(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    global _models_cache  # MUST be before first use
 
+    now = time.time()
+    t_cached, models_cached = _models_cache
+    if models_cached and (now - t_cached) < MODELS_CACHE_TTL_SEC:
+        return models_cached
 
-def log_proxy(username: str, api_path: str, body_bytes: int, note: str = "") -> None:
-    msg = f"[{now_human()}] proxy user={username} path={api_path} bytes={body_bytes}"
-    if note:
-        msg += f" note={note}"
-    print(msg)
+    tags = await ollama_fetch_json(session, "GET", "/api/tags", None)
+    models = tags.get("models", []) or []
 
+    enriched: List[Dict[str, Any]] = []
+    for m in models:
+        name = m.get("name") or m.get("model") or ""
+        if not name:
+            continue
 
-# ==========================
-# Web UI (mobile-first)
-# ==========================
+        caps = m.get("capabilities")
+        details = m.get("details") or {}
+
+        if not caps:
+            try:
+                show = await ollama_get_show(session, name)
+                caps = show.get("capabilities") or []
+                if show.get("details"):
+                    details = show.get("details") or details
+            except Exception:
+                caps = []
+
+        if isinstance(caps, list):
+            caps_norm = [str(c) for c in caps]
+        else:
+            caps_norm = [str(caps)]
+
+        enriched.append({
+            "name": name,
+            "modified_at": m.get("modified_at"),
+            "size": m.get("size"),
+            "digest": m.get("digest"),
+            "details": details,
+            "capabilities": caps_norm,
+        })
+
+    enriched.sort(key=lambda x: x["name"])
+    _models_cache = (now, enriched)
+    return enriched
+
+async def model_capabilities(session: aiohttp.ClientSession, model: str) -> List[str]:
+    show = await ollama_get_show(session, model)
+    caps = show.get("capabilities") or []
+    if isinstance(caps, list):
+        return [str(c) for c in caps]
+    return [str(caps)]
+
+def _strip_data_url(b64_or_dataurl: str) -> str:
+    s = b64_or_dataurl.strip()
+    if "base64," in s:
+        s = s.split("base64,", 1)[1]
+    return s.strip()
+
+# =========================
+# Web UI
+# =========================
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Ollama Portal</title>
-<style>
-  :root{
-    --bg:#070707; --bg2:#0d0d0d;
-    --panel:#111111; --panel2:#151515;
-    --border:#232323;
-    --text:#e8e8e8; --muted:#b0b0b0;
-    --accent:#ffae00; --danger:#ff3b3b;
-    --r:8px;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  }
-  *{ box-sizing:border-box; }
-  html,body{ height:100%; }
-  body{ margin:0; background:linear-gradient(180deg,var(--bg),var(--bg2)); color:var(--text); font-family:var(--mono); }
-
-  .app{ height:100%; display:flex; flex-direction:column; }
-  .topbar{
-    position:sticky; top:0; z-index:20;
-    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-    padding:10px 12px; background:rgba(10,10,10,0.92);
-    border-bottom:1px solid var(--border);
-    backdrop-filter: blur(8px);
-  }
-  .brand{ display:flex; align-items:center; gap:10px; min-width:180px; }
-  .hamburger{
-    width:40px; height:36px; border-radius:var(--r);
-    border:1px solid var(--border); background:var(--panel);
-    color:var(--text); cursor:pointer;
-    display:flex; align-items:center; justify-content:center;
-  }
-  .title{ font-weight:700; letter-spacing:0.4px; }
-  .badge{
-    border:1px solid var(--border); background:var(--panel);
-    padding:6px 9px; border-radius:var(--r);
-    font-size:12px; color:var(--muted);
-    display:flex; align-items:center; gap:8px;
-  }
-  .dot{ width:8px; height:8px; border-radius:999px; background:var(--muted); }
-  .dot.ok{ background:var(--accent); }
-  .dot.bad{ background:var(--danger); }
-  .spacer{ flex:1; }
-
-  .btn{
-    border:1px solid var(--border); background:var(--panel);
-    color:var(--text); border-radius:var(--r);
-    padding:9px 11px; cursor:pointer; font-family:var(--mono);
-  }
-  .btn.primary{ background:var(--accent); border-color:#c98700; color:#111; font-weight:700; }
-  .btn.danger{ background:#1a0f0f; border-color:#3a1b1b; color:#ffd0d0; }
-  .btn:active{ transform: translateY(1px); }
-
-  .select,.input,.textarea{
-    width:100%; border:1px solid var(--border);
-    background:var(--panel); color:var(--text);
-    border-radius:var(--r); padding:10px 11px; font-family:var(--mono);
-  }
-  .textarea{ min-height:54px; resize:vertical; }
-
-  .shell{ flex:1; display:flex; min-height:0; }
-  .sidebar{
-    width:300px; max-width:86vw;
-    background:linear-gradient(180deg,#0c0c0c,#0a0a0a);
-    border-right:1px solid var(--border);
-    padding:12px; display:flex; flex-direction:column; gap:12px;
-  }
-  .sidebarOverlay{ position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:30; display:none; }
-  .sidebarSheet{
-    position:fixed; top:0; left:0; bottom:0;
-    width:300px; max-width:86vw;
-    background:linear-gradient(180deg,#0c0c0c,#0a0a0a);
-    border-right:1px solid var(--border);
-    padding:12px; display:flex; flex-direction:column; gap:12px;
-    transform:translateX(-105%); transition:transform 180ms ease-out;
-    z-index:40;
-  }
-  .sidebarOverlay.open{ display:block; }
-  .sidebarSheet.open{ transform:translateX(0); }
-  .closeRow{ display:flex; align-items:center; gap:8px; }
-
-  .card{
-    border:1px solid var(--border);
-    background:rgba(17,17,17,0.92);
-    border-radius:var(--r);
-    padding:10px;
-  }
-  .card h3{
-    margin:0 0 8px 0;
-    font-size:12px; color:var(--muted);
-    font-weight:700; letter-spacing:0.5px;
-    text-transform:uppercase;
-  }
-  .row{ display:flex; gap:10px; flex-wrap:wrap; }
-  .row > *{ flex:1 1 auto; min-width:120px; }
-  .hint{ font-size:12px; color:var(--muted); line-height:1.35; }
-  .pill{
-    border:1px solid #3b2a00;
-    background:rgba(255,174,0,0.08);
-    color:var(--accent);
-    padding:4px 8px; border-radius:var(--r);
-    font-size:12px;
-  }
-
-  .sessions{ display:flex; flex-direction:column; gap:8px; overflow:auto; min-height:0; }
-  .session{
-    border:1px solid var(--border);
-    border-radius:var(--r); padding:10px;
-    background:var(--panel); cursor:pointer;
-  }
-  .session.active{
-    border-color:#3b2a00;
-    box-shadow: 0 0 0 2px rgba(255,174,0,0.18) inset;
-  }
-  .sessionTitle{ font-weight:700; font-size:13px; }
-  .sessionMeta{ font-size:12px; color:var(--muted); margin-top:4px; }
-
-  .main{ flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
-  .chat{ flex:1; overflow:auto; padding:12px; display:flex; flex-direction:column; gap:10px; }
-  .msg{
-    max-width:920px; width:100%;
-    border:1px solid var(--border);
-    background:rgba(17,17,17,0.92);
-    border-radius:var(--r);
-    padding:10px 11px;
-  }
-  .msg.user{ background:rgba(20,20,20,0.92); }
-  .msg.assistant{ background:rgba(14,14,14,0.92); }
-  .meta{ display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-bottom:6px; }
-  .roleTag{
-    border:1px solid var(--border);
-    border-radius:var(--r);
-    padding:3px 7px; background:#0f0f0f;
-  }
-  .content{ white-space:pre-wrap; word-break:break-word; line-height:1.35; font-size:13px; }
-  .imgStrip{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-  .thumb{
-    width:64px; height:64px; border-radius:var(--r);
-    border:1px solid var(--border); object-fit:cover; background:#000;
-  }
-
-  .composer{
-    border-top:1px solid var(--border);
-    background:rgba(10,10,10,0.92);
-    padding:10px 12px;
-    display:flex; flex-direction:column; gap:10px;
-  }
-  .composeRow{ display:flex; gap:10px; flex-wrap:wrap; align-items:stretch; }
-  .composeRow .grow{ flex:1 1 260px; min-width:200px; }
-  .composeRow .actions{ display:flex; gap:10px; flex-wrap:wrap; }
-  .fileRow{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  .fileNote{ font-size:12px; color:var(--muted); }
-
-  /* Modal */
-  .modalOverlay{
-    position:fixed; inset:0;
-    background:rgba(0,0,0,0.66);
-    display:none; align-items:center; justify-content:center;
-    padding:18px; z-index:100;
-  }
-  .modalOverlay.open{ display:flex; }
-  .modal{
-    width:min(520px,100%);
-    border:1px solid var(--border);
-    background:linear-gradient(180deg,#101010,#0b0b0b);
-    border-radius:var(--r);
-    padding:14px;
-    display:flex; flex-direction:column; gap:12px;
-  }
-  .modalHeader{ display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-  .tabs{ display:flex; gap:10px; flex-wrap:wrap; }
-  .tabs .btn{ flex:1 1 140px; }
-  .msgBox{
-    border:1px solid var(--border);
-    background:rgba(17,17,17,0.92);
-    border-radius:var(--r);
-    padding:10px; font-size:12px; color:var(--muted); line-height:1.35;
-  }
-  .toast{
-    position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
-    z-index:200;
-    padding:10px 12px; border-radius:var(--r);
-    border:1px solid var(--border);
-    background:rgba(17,17,17,0.94);
-    color:var(--text); max-width:min(720px,92vw);
-    display:none;
-  }
-  .toast.open{ display:block; }
-
-  @media (min-width:980px){
-    .hamburger{ display:none; }
-    .sidebarOverlay,.sidebarSheet{ display:none !important; }
-    .sidebar{ display:flex; }
-  }
-  @media (max-width:979px){
-    .sidebar{ display:none; }
-  }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Ollama Mobile Chat</title>
+  <style>
+    :root{
+      --bg:#0b0b0c;
+      --panel:#121315;
+      --panel2:#17191c;
+      --text:#e8e8e8;
+      --muted:#a0a0a0;
+      --accent:#ffae00;
+      --radius:8px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+      --shadow: 0 12px 28px rgba(0,0,0,.45);
+      --border: 1px solid rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:var(--mono)}
+    button,input,select,textarea{font-family:var(--mono)}
+    .app{height:100%;display:flex;overflow:hidden}
+    .sidebar{
+      position:fixed;inset:0 auto 0 0;
+      width:min(86vw, 360px);
+      background:linear-gradient(180deg, var(--panel), var(--panel2));
+      border-right: var(--border);
+      transform:translateX(-105%);
+      transition:transform .22s ease;
+      z-index:30;
+      box-shadow:var(--shadow);
+      display:flex;flex-direction:column;
+      padding:12px;gap:12px;
+    }
+    .sidebar.open{transform:translateX(0)}
+    .sidebar-header{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      padding:10px;border:var(--border);border-radius:var(--radius);
+      background:rgba(255,255,255,.02);
+    }
+    .pill{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:8px 10px;border-radius:999px;border:var(--border);
+      background:rgba(255,255,255,.02);color:var(--muted);font-size:12px;white-space:nowrap;
+    }
+    .btn{
+      border:var(--border);background:rgba(255,255,255,.03);
+      color:var(--text);padding:10px 12px;border-radius:var(--radius);
+      cursor:pointer;transition:transform .02s ease, border-color .15s ease, background .15s ease;
+    }
+    .btn:active{transform:translateY(1px)}
+    .btn.primary{border-color:rgba(255,174,0,.35);background:rgba(255,174,0,.12)}
+    .btn.ghost{background:transparent;color:var(--muted)}
+    .btn.danger{border-color:rgba(255,80,80,.35);background:rgba(255,80,80,.10)}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .col{display:flex;flex-direction:column;gap:8px}
+    .label{font-size:12px;color:var(--muted)}
+    .input,.select,.textarea{
+      width:100%;padding:10px 12px;border-radius:var(--radius);
+      border:var(--border);background:rgba(255,255,255,.02);color:var(--text);outline:none;
+    }
+    .divider{height:1px;background:rgba(255,255,255,.08);margin:6px 0}
+    .sessions{display:flex;flex-direction:column;gap:8px;overflow:auto;padding-bottom:8px}
+    .session-item{
+      padding:10px;border-radius:var(--radius);border:var(--border);
+      background:rgba(255,255,255,.02);cursor:pointer;
+      display:flex;flex-direction:column;gap:6px;
+    }
+    .session-item.active{border-color:rgba(255,174,0,.35);background:rgba(255,174,0,.08)}
+    .session-title{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .session-meta{font-size:11px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap}
+    .main{flex:1;display:flex;flex-direction:column;width:100%}
+    .topbar{
+      position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:10px 12px;border-bottom:var(--border);
+      background:rgba(10,10,11,.92);backdrop-filter: blur(8px);
+    }
+    .brand{display:flex;align-items:center;gap:10px;min-width:0}
+    .burger{
+      width:40px;height:40px;display:grid;place-items:center;border-radius:var(--radius);
+      border:var(--border);background:rgba(255,255,255,.02);cursor:pointer;flex:0 0 auto;
+    }
+    .title{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48vw}
+    .badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .badge{
+      font-size:11px;padding:6px 8px;border-radius:999px;border:var(--border);
+      background:rgba(255,255,255,.02);color:var(--muted);
+    }
+    .badge.accent{border-color:rgba(255,174,0,.35);background:rgba(255,174,0,.10);color:var(--text)}
+    .chat{flex:1;overflow:auto;padding:14px 12px 10px;display:flex;flex-direction:column;gap:10px}
+    .msg{
+      max-width:min(820px, 96vw);padding:12px;border-radius:var(--radius);
+      border:var(--border);background:rgba(255,255,255,.02);
+      word-wrap:break-word;white-space:pre-wrap;line-height:1.35;
+    }
+    .msg.user{align-self:flex-end;background:rgba(255,174,0,.07);border-color:rgba(255,174,0,.25)}
+    .msg.assistant{align-self:flex-start}
+    .msg .meta{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:8px}
+    .thinking{
+      margin-top:10px;padding:10px;border-radius:var(--radius);
+      border:1px dashed rgba(255,174,0,.35);background:rgba(255,174,0,.06);
+      font-size:12px;white-space:pre-wrap;
+    }
+    .imggrid{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .imggrid img{max-width:220px;border-radius:var(--radius);border:var(--border);background:rgba(0,0,0,.25)}
+    .composer{
+      padding:10px 12px;border-top:var(--border);
+      background:rgba(10,10,11,.92);backdrop-filter: blur(8px);
+      display:flex;flex-direction:column;gap:10px;
+    }
+    .composer-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+    .composer textarea{flex:1;min-height:44px;max-height:140px;resize:none;overflow:auto}
+    .hint{font-size:11px;color:var(--muted)}
+    .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:20;display:none}
+    .overlay.show{display:block}
+    .modal{position:fixed;inset:0;display:none;place-items:center;z-index:40;padding:16px}
+    .modal.show{display:grid}
+    .card{
+      width:min(560px, 92vw);background:linear-gradient(180deg, var(--panel), var(--panel2));
+      border:var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;
+      display:flex;flex-direction:column;gap:12px;
+    }
+    .card h2{margin:0;font-size:14px}
+    .card p{margin:0;color:var(--muted);font-size:12px;line-height:1.4}
+    .card .grid{display:grid;grid-template-columns:1fr;gap:10px}
+    @media(min-width:720px){.title{max-width:40vw}.card .grid{grid-template-columns:1fr 1fr}}
+    .tiny{font-size:11px;color:var(--muted)}
+    .right{margin-left:auto}
+    .hide{display:none !important}
+  </style>
 </head>
 <body>
 <div class="app">
+  <div id="overlay" class="overlay"></div>
 
-  <div class="topbar">
-    <div class="brand">
-      <button class="hamburger" id="openSide" aria-label="Open sidebar">☰</button>
-      <div class="title">Ollama Portal</div>
+  <aside id="sidebar" class="sidebar" aria-label="Sidebar">
+    <div class="sidebar-header">
+      <div class="col" style="gap:2px;min-width:0;">
+        <div style="font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          <span style="color:var(--accent)">ollama</span> / mobile chat
+        </div>
+        <div class="tiny" id="whoami">not signed in</div>
+      </div>
+      <button class="btn ghost" id="closeSidebar">Close</button>
     </div>
-    <div class="badge"><span class="dot bad" id="authDot"></span><span id="authText">logged out</span></div>
-    <div class="badge"><span class="dot bad" id="ollamaDot"></span><span id="ollamaText">ollama: ?</span></div>
-    <div class="badge"><span id="statusText">idle</span></div>
-    <div class="spacer"></div>
-    <button class="btn" id="logoutBtn">Logout</button>
-  </div>
 
-  <div class="sidebarOverlay" id="sideOverlay"></div>
-  <div class="sidebarSheet" id="sideSheet">
-    <div class="closeRow">
-      <div class="pill">Settings</div>
-      <div class="spacer"></div>
-      <button class="btn" id="closeSide">Close</button>
+    <div class="row">
+      <button class="btn primary" id="newSession">New session</button>
+      <button class="btn" id="refreshModels">Refresh models</button>
     </div>
-    <div id="sidebarInnerMobile" style="display:flex; flex-direction:column; gap:12px; min-height:0;"></div>
-  </div>
 
-  <div class="shell">
-    <div class="sidebar" id="sidebarInnerDesktop"></div>
+    <div class="divider"></div>
 
-    <div class="main">
-      <div class="chat" id="chat"></div>
+    <div class="col">
+      <div class="label">Sessions</div>
+      <div id="sessions" class="sessions"></div>
+    </div>
 
-      <div class="composer">
-        <div class="composeRow">
-          <textarea class="textarea grow" id="input" placeholder="Type a message... (Enter = send, Shift+Enter = newline)"></textarea>
-          <div class="actions">
-            <button class="btn danger" id="stopBtn">Stop</button>
-            <button class="btn primary" id="sendBtn">Send</button>
+    <div class="divider"></div>
+
+    <div class="col">
+      <div class="label">Settings</div>
+
+      <div class="row" style="align-items:flex-start">
+        <div class="col" style="flex:1;min-width:240px">
+          <div class="label">Model</div>
+          <select id="modelSelect" class="select"></select>
+          <div id="modelCaps" class="row" style="gap:8px"></div>
+        </div>
+
+        <div class="col" style="flex:1;min-width:240px">
+          <div class="label">Thinking</div>
+
+          <div id="thinkBoolWrap" class="row hide">
+            <button id="thinkToggle" class="btn">Thinking: off</button>
+            <button id="showThinkingToggle" class="btn">Show trace: on</button>
           </div>
+
+          <div id="thinkLevelWrap" class="col hide">
+            <select id="thinkLevel" class="select">
+              <option value="low">Thinking: low</option>
+              <option value="medium">Thinking: medium</option>
+              <option value="high">Thinking: high</option>
+            </select>
+            <div class="tiny">GPT-OSS uses levels.</div>
+            <button id="showThinkingToggle2" class="btn">Show trace: on</button>
+          </div>
+
+          <div id="thinkUnsupported" class="tiny">This model does not advertise thinking capability.</div>
         </div>
-        <div class="fileRow">
-          <input type="file" id="file" accept="image/*" multiple />
-          <div class="fileNote" id="fileNote">No images attached.</div>
-        </div>
-        <div class="imgStrip" id="attachStrip"></div>
+      </div>
+
+      <div class="row">
+        <button class="btn" id="clearToken">Sign out</button>
+      </div>
+
+      <div class="tiny" id="statusLine"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="brand">
+        <div class="burger" id="openSidebar" aria-label="Open sidebar">☰</div>
+        <div class="title" id="sessionTitle">No session</div>
+      </div>
+      <div class="badges" id="topBadges"></div>
+    </header>
+
+    <section id="chat" class="chat" aria-label="Chat"></section>
+
+    <footer class="composer">
+      <div class="composer-row">
+        <button class="btn" id="attachBtn">Attach</button>
+        <input id="fileInput" type="file" accept="image/*" class="hide" />
+        <textarea id="prompt" class="input" placeholder="Type a message…" spellcheck="false"></textarea>
+        <button class="btn primary" id="sendBtn">Send</button>
+      </div>
+      <div class="hint" id="composerHint">Select a session and model to chat.</div>
+    </footer>
+  </main>
+</div>
+
+<div id="authModal" class="modal">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2>Sign in</h2>
+      <span class="pill">token → localStorage</span>
+    </div>
+    <p>Auth is required. Chat history is stored on-device in IndexedDB.</p>
+    <div class="grid">
+      <div class="col">
+        <div class="label">Username</div>
+        <input id="authUser" class="input" autocomplete="username" />
+      </div>
+      <div class="col">
+        <div class="label">Password</div>
+        <input id="authPass" type="password" class="input" autocomplete="current-password" />
       </div>
     </div>
-  </div>
-
-</div>
-
-<div class="modalOverlay" id="authModal">
-  <div class="modal">
-    <div class="modalHeader">
-      <div class="pill">Authentication</div>
-      <div class="hint">Token in <b>localStorage</b>. Sessions/messages in <b>IndexedDB</b>.</div>
-    </div>
-    <div class="tabs">
-      <button class="btn" id="tabLogin">Login</button>
-      <button class="btn" id="tabSignup">Sign up</button>
-    </div>
-
-    <div id="loginPane" style="display:flex; flex-direction:column; gap:10px;">
-      <input class="input" id="loginUser" placeholder="username" autocomplete="username" />
-      <input class="input" id="loginPass" placeholder="password" type="password" autocomplete="current-password" />
+    <div class="row">
       <button class="btn primary" id="loginBtn">Login</button>
-      <div class="msgBox" id="loginMsg"></div>
-    </div>
-
-    <div id="signupPane" style="display:none; flex-direction:column; gap:10px;">
-      <input class="input" id="signupUser" placeholder="username" autocomplete="username" />
-      <input class="input" id="signupPass" placeholder="password (min 10 chars)" type="password" autocomplete="new-password" />
-      <button class="btn primary" id="signupBtn">Create account</button>
-      <div class="msgBox" id="signupMsg"></div>
-    </div>
-
-    <div class="msgBox">
-      Proxies only safe Ollama endpoints: tags/version/chat/generate/embeddings. No pull/delete/create.
+      <button class="btn" id="signupBtn">Sign up</button>
+      <span class="right tiny" id="authMsg"></span>
     </div>
   </div>
 </div>
-
-<div class="toast" id="toast"></div>
 
 <script>
 (() => {
-  const $ = (id) => document.getElementById(id);
-  const esc = (s) => (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
-
-  // UUID v4 fallback for Safari/old WebViews
-  function uuidv4(){
-    // Prefer crypto.getRandomValues
-    const cryptoObj = window.crypto || window.msCrypto;
-    if (cryptoObj && cryptoObj.getRandomValues){
-      const b = new Uint8Array(16);
-      cryptoObj.getRandomValues(b);
-      b[6] = (b[6] & 0x0f) | 0x40;
-      b[8] = (b[8] & 0x3f) | 0x80;
-      const hex = [...b].map(x => x.toString(16).padStart(2,"0")).join("");
-      return (
-        hex.slice(0,8) + "-" +
-        hex.slice(8,12) + "-" +
-        hex.slice(12,16) + "-" +
-        hex.slice(16,20) + "-" +
-        hex.slice(20)
-      );
-    }
-    // Weak fallback (still unique-ish)
-    const s4 = () => Math.floor((1+Math.random())*0x10000).toString(16).slice(1);
-    return `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
+  function uuidv4() {
+    if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (globalThis.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+    else for (let i=0;i<16;i++) bytes[i] = Math.floor(Math.random()*256);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(b => b.toString(16).padStart(2,'0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
   }
 
-  // Toast / status
-  function toast(msg, ms=3200){
-    const t = $("toast");
-    t.textContent = msg;
-    t.classList.add("open");
-    setTimeout(() => t.classList.remove("open"), ms);
-  }
-  function setStatus(s){ $("statusText").textContent = s; }
-  function setAuth(ok, text){
-    $("authText").textContent = text;
-    $("authDot").className = "dot " + (ok ? "ok" : "bad");
-  }
-  function setOllama(ok, text){
-    $("ollamaText").textContent = text;
-    $("ollamaDot").className = "dot " + (ok ? "ok" : "bad");
-  }
+  const el = (id) => document.getElementById(id);
+  const sidebar = el('sidebar');
+  const overlay = el('overlay');
+  const authModal = el('authModal');
 
-  // Mobile sidebar open/close
-  function openSide(){ $("sideOverlay").classList.add("open"); $("sideSheet").classList.add("open"); }
-  function closeSide(){ $("sideOverlay").classList.remove("open"); $("sideSheet").classList.remove("open"); }
-  $("openSide").onclick = openSide;
-  $("closeSide").onclick = closeSide;
-  $("sideOverlay").onclick = closeSide;
+  function setStatus(msg){ el('statusLine').textContent = msg || ''; }
+  function setAuthMsg(msg){ el('authMsg').textContent = msg || ''; }
+  function clampTitle(s){ return (s||'').trim().slice(0,60) || 'Untitled'; }
 
-  // Auth
-  const TOKEN_KEY = "ollamaPortalToken_v2";
-  function getToken(){ return localStorage.getItem(TOKEN_KEY) || ""; }
+  function openSidebar(){ sidebar.classList.add('open'); overlay.classList.add('show'); }
+  function closeSidebar(){ sidebar.classList.remove('open'); overlay.classList.remove('show'); }
+
+  el('openSidebar').onclick = openSidebar;
+  el('closeSidebar').onclick = closeSidebar;
+  overlay.onclick = closeSidebar;
+
+  const TOKEN_KEY = 'ollama_chat_token';
+  const USER_KEY = 'ollama_chat_user';
+
+  function getToken(){ return localStorage.getItem(TOKEN_KEY) || ''; }
   function setToken(t){ localStorage.setItem(TOKEN_KEY, t); }
-  function clearToken(){ localStorage.removeItem(TOKEN_KEY); }
-
-  async function api(path, opts={}){
-    const headers = Object.assign({}, opts.headers || {});
-    const token = getToken();
-    if (token) headers["Authorization"] = "Bearer " + token;
-    headers["Cache-Control"] = "no-store";
-    return fetch(path, Object.assign({}, opts, { headers }));
+  function clearToken(){
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
   }
 
-  async function whoAmI(){
+  async function api(path, {method='GET', body=null, headers={}} = {}) {
+    const h = Object.assign({}, headers);
+    if (body && !h['Content-Type']) h['Content-Type'] = 'application/json';
+    const tok = getToken();
+    if (tok) h['Authorization'] = 'Bearer ' + tok;
+
+    const res = await fetch(path, { method, headers: h, body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    if (!res.ok) {
+      const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `HTTP ${res.status}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  function showAuthModal(show){ authModal.classList.toggle('show', !!show); }
+
+  async function whoami() {
     try{
-      const r = await api("/auth/me");
-      if (!r.ok) return null;
-      return await r.json();
-    } catch { return null; }
+      const me = await api('/api/auth/me');
+      el('whoami').textContent = `signed in as ${me.username}`;
+      localStorage.setItem(USER_KEY, me.username);
+      return me;
+    }catch(e){
+      el('whoami').textContent = 'not signed in';
+      return null;
+    }
   }
+
+  el('clearToken').onclick = async () => {
+    clearToken();
+    showAuthModal(true);
+    setStatus('Signed out.');
+  };
+
+  el('loginBtn').onclick = async () => {
+    setAuthMsg('');
+    const username = el('authUser').value.trim();
+    const password = el('authPass').value;
+    if (!username || !password){ setAuthMsg('missing fields'); return; }
+    try{
+      const out = await api('/api/auth/login', {method:'POST', body:{username,password}});
+      setToken(out.token);
+      localStorage.setItem(USER_KEY, out.username);
+      showAuthModal(false);
+      await boot();
+    }catch(e){
+      setAuthMsg(e.message);
+    }
+  };
+
+  el('signupBtn').onclick = async () => {
+    setAuthMsg('');
+    const username = el('authUser').value.trim();
+    const password = el('authPass').value;
+    if (!username || !password){ setAuthMsg('missing fields'); return; }
+    try{
+      await api('/api/auth/signup', {method:'POST', body:{username,password}});
+      setAuthMsg('created — now login');
+    }catch(e){
+      setAuthMsg(e.message);
+    }
+  };
 
   // IndexedDB
-  const DB_NAME = "ollamaPortalDB_v2";
+  const DB_NAME = 'ollama_mobile_chat';
   const DB_VER = 1;
+  const STORE_SESS = 'sessions';
+  const STORE_MSG = 'messages';
 
   function openDB(){
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VER);
       req.onupgradeneeded = () => {
         const db = req.result;
-        if (!db.objectStoreNames.contains("sessions")){
-          db.createObjectStore("sessions", { keyPath:"id" });
+        if (!db.objectStoreNames.contains(STORE_SESS)) {
+          const s = db.createObjectStore(STORE_SESS, { keyPath:'id' });
+          s.createIndex('by_user', 'user', { unique:false });
+          s.createIndex('by_updated', 'updatedAt', { unique:false });
         }
-        if (!db.objectStoreNames.contains("messages")){
-          const ms = db.createObjectStore("messages", { keyPath:"id", autoIncrement:true });
-          ms.createIndex("by_session", "sessionId", { unique:false });
+        if (!db.objectStoreNames.contains(STORE_MSG)) {
+          const m = db.createObjectStore(STORE_MSG, { keyPath:'id' });
+          m.createIndex('by_user', 'user', { unique:false });
+          m.createIndex('by_session', 'sessionId', { unique:false });
+          m.createIndex('by_session_ts', ['sessionId','ts'], { unique:false });
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -739,1074 +805,841 @@ INDEX_HTML = r"""<!doctype html>
     });
   }
 
-  async function tx(storeNames, mode, fn){
+  async function dbTx(store, mode, fn){
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const t = db.transaction(storeNames, mode);
-      const stores = storeNames.map(n => t.objectStore(n));
-      let out;
-      t.oncomplete = () => resolve(out);
-      t.onerror = () => reject(t.error);
-      fn(stores, (v) => out = v);
+      const tx = db.transaction(store, mode);
+      const st = tx.objectStore(store);
+      const out = fn(st, tx);
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function putSession(sess){ return dbTx(STORE_SESS, 'readwrite', (st) => st.put(sess)); }
+  async function addMessage(msg){ return dbTx(STORE_MSG, 'readwrite', (st) => st.put(msg)); }
+
+  async function delSession(id){
+    await dbTx(STORE_SESS, 'readwrite', (st) => st.delete(id));
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_MSG, 'readwrite');
+      const idx = tx.objectStore(STORE_MSG).index('by_session');
+      const req = idx.openCursor(IDBKeyRange.only(id));
+      req.onsuccess = () => { const cur = req.result; if (cur){ cur.delete(); cur.continue(); } };
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
     });
   }
 
   async function listSessions(){
-    return tx(["sessions"], "readonly", ([st], done) => {
-      const r = st.getAll();
-      r.onsuccess = () => {
-        const rows = r.result || [];
-        rows.sort((a,b) => (b.updatedAt||0)-(a.updatedAt||0));
-        done(rows);
-      };
-    });
-  }
-  async function putSession(s){
-    return tx(["sessions"], "readwrite", ([st], done) => { st.put(s); done(true); });
-  }
-  async function deleteSession(sessionId){
-    return tx(["sessions","messages"], "readwrite", ([ss, ms], done) => {
-      ss.delete(sessionId);
-      const idx = ms.index("by_session");
-      const cur = idx.openCursor(IDBKeyRange.only(sessionId));
-      cur.onsuccess = () => {
-        const c = cur.result;
-        if (c){ ms.delete(c.primaryKey); c.continue(); }
-      };
-      done(true);
-    });
-  }
-  async function getMessages(sessionId){
+    const user = localStorage.getItem(USER_KEY) || '';
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const t = db.transaction(["messages"], "readonly");
-      const idx = t.objectStore("messages").index("by_session");
-      const r = idx.getAll(IDBKeyRange.only(sessionId));
-      r.onsuccess = () => {
-        const rows = r.result || [];
-        rows.sort((a,b) => (a.ts||0)-(b.ts||0));
-        resolve(rows);
+      const tx = db.transaction(STORE_SESS, 'readonly');
+      const idx = tx.objectStore(STORE_SESS).index('by_user');
+      const req = idx.getAll(IDBKeyRange.only(user));
+      req.onsuccess = () => {
+        const items = req.result || [];
+        items.sort((a,b) => (b.updatedAt||0)-(a.updatedAt||0));
+        resolve(items);
       };
-      r.onerror = () => reject(r.error);
+      req.onerror = () => reject(req.error);
     });
   }
-  async function addMessage(m){
+
+  async function listMessages(sessionId){
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const t = db.transaction(["messages"], "readwrite");
-      const st = t.objectStore("messages");
-      const r = st.add(m);
-      r.onsuccess = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
+      const tx = db.transaction(STORE_MSG, 'readonly');
+      const idx = tx.objectStore(STORE_MSG).index('by_session_ts');
+      const req = idx.getAll(IDBKeyRange.bound([sessionId,0],[sessionId,Number.MAX_SAFE_INTEGER]));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
     });
-  }
-  async function updateMessage(id, patch){
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const t = db.transaction(["messages"], "readwrite");
-      const st = t.objectStore("messages");
-      const g = st.get(id);
-      g.onsuccess = () => {
-        const obj = g.result;
-        if (!obj) return resolve(false);
-        Object.assign(obj, patch);
-        st.put(obj);
-        resolve(true);
-      };
-      g.onerror = () => reject(g.error);
-    });
-  }
-
-  // Sidebar content (duplicated desktop/mobile)
-  function sidebarContent(){
-    const wrap = document.createElement("div");
-    wrap.style.display="flex";
-    wrap.style.flexDirection="column";
-    wrap.style.gap="12px";
-    wrap.style.minHeight="0";
-
-    const settings = document.createElement("div");
-    settings.className="card";
-    settings.innerHTML = `
-      <h3>Settings</h3>
-      <div class="row" style="margin-bottom:10px;">
-        <div style="min-width:180px;">
-          <div class="hint" style="margin-bottom:6px;">Model</div>
-          <select class="select" id="modelSelect"></select>
-        </div>
-        <div style="min-width:120px;">
-          <div class="hint" style="margin-bottom:6px;">Mode</div>
-          <select class="select" id="modeSelect">
-            <option value="chat">chat</option>
-            <option value="generate">generate</option>
-            <option value="embed">embed</option>
-          </select>
-        </div>
-      </div>
-      <div class="hint" style="margin-bottom:6px;">System prompt (chat/generate)</div>
-      <textarea class="textarea" id="systemPrompt" placeholder="Optional system prompt..."></textarea>
-      <div class="row" style="margin-top:10px;">
-        <div>
-          <div class="hint" style="margin-bottom:6px;">temperature</div>
-          <input class="input" id="temp" type="number" min="0" max="2" step="0.05" value="0.7" />
-        </div>
-        <div>
-          <div class="hint" style="margin-bottom:6px;">top_p</div>
-          <input class="input" id="topP" type="number" min="0" max="1" step="0.05" value="0.9" />
-        </div>
-        <div>
-          <div class="hint" style="margin-bottom:6px;">num_predict</div>
-          <input class="input" id="numPredict" type="number" min="-2" max="4096" step="32" value="512" />
-        </div>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn" id="refreshModelsBtn">Refresh models</button>
-        <button class="btn" id="newSessionBtn">New session</button>
-        <button class="btn danger" id="delSessionBtn">Delete session</button>
-      </div>
-      <div class="hint" id="modelHint" style="margin-top:8px;">—</div>
-    `;
-    wrap.appendChild(settings);
-
-    const sess = document.createElement("div");
-    sess.className="card";
-    sess.style.minHeight="0";
-    sess.innerHTML = `
-      <h3>Sessions</h3>
-      <div class="sessions" id="sessions"></div>
-      <div class="hint" style="margin-top:10px;">
-        Sessions + messages persist on this device (IndexedDB).
-      </div>
-    `;
-    wrap.appendChild(sess);
-
-    return wrap;
-  }
-
-  function mountSidebar(){
-    $("sidebarInnerDesktop").innerHTML = "";
-    $("sidebarInnerDesktop").appendChild(sidebarContent());
-    $("sidebarInnerMobile").innerHTML = "";
-    $("sidebarInnerMobile").appendChild(sidebarContent());
-  }
-
-  function getSidebarRoot(){
-    const desktopVisible = window.matchMedia("(min-width: 980px)").matches;
-    return desktopVisible ? $("sidebarInnerDesktop") : $("sidebarInnerMobile");
-  }
-  function q(id){
-    const root = getSidebarRoot();
-    return root.querySelector("#" + id);
   }
 
   // App state
-  let currentUser = null;
-  let currentSessionId = null;
-  let aborter = null;
-  let attached = []; // {name,mime,b64,dataUrl}
+  let MODELS = [];
+  let MODEL_BY_NAME = new Map();
+  let activeSessionId = null;
+  let activeSession = null;
+  let activeMessages = [];
+  let pendingImages = []; // [{dataUrl,b64}]
 
-  function prettyTime(ts){ try { return new Date(ts).toLocaleString(); } catch { return ""; } }
+  function modelInfo(name){ return MODEL_BY_NAME.get(name) || null; }
+  function capsFor(name){
+    const m = modelInfo(name);
+    const caps = (m && m.capabilities) ? m.capabilities : [];
+    return Array.isArray(caps) ? caps : [];
+  }
+  function hasCap(name, cap){ return capsFor(name).includes(cap); }
 
-  function renderSessions(list){
-    const root = q("sessions");
-    root.innerHTML = "";
-    for (const s of list){
-      const div = document.createElement("div");
-      div.className = "session" + (s.id === currentSessionId ? " active" : "");
-      div.onclick = () => { selectSession(s.id); closeSide(); };
-      div.innerHTML = `
-        <div class="sessionTitle">${esc(s.title || "Untitled")}</div>
-        <div class="sessionMeta">${esc(s.model || "")} • ${esc(prettyTime(s.updatedAt || s.createdAt))}</div>
-      `;
-      root.appendChild(div);
-    }
+  function renderCapsBadges(target, caps){
+    target.innerHTML = '';
+    (caps||[]).forEach(c => {
+      const b = document.createElement('span');
+      b.className = 'badge' + ((c==='vision' || c==='thinking') ? ' accent' : '');
+      b.textContent = c;
+      target.appendChild(b);
+    });
   }
 
-  function msgEl(m){
-    const div = document.createElement("div");
-    div.className = "msg " + (m.role === "user" ? "user" : "assistant");
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.innerHTML = `<span class="roleTag">${esc(m.role)}</span><span>${esc(prettyTime(m.ts))}</span>`;
-    const content = document.createElement("div");
-    content.className = "content";
-    content.textContent = m.content || "";
-    div.appendChild(meta);
-    div.appendChild(content);
+  function applyModelUI(){
+    const sel = el('modelSelect').value;
+    const caps = capsFor(sel);
+    renderCapsBadges(el('modelCaps'), caps);
+    renderCapsBadges(el('topBadges'), caps);
 
-    if (m.images && m.images.length){
-      const strip = document.createElement("div");
-      strip.className = "imgStrip";
-      for (const im of m.images){
-        const img = document.createElement("img");
-        img.className = "thumb";
-        img.src = im.dataUrl || "";
-        strip.appendChild(img);
+    // image upload only for vision
+    el('attachBtn').classList.toggle('hide', !caps.includes('vision'));
+
+    // thinking controls only for thinking
+    const canThink = caps.includes('thinking');
+    const isGptOss = (sel || '').toLowerCase().includes('gpt-oss');
+
+    el('thinkUnsupported').classList.toggle('hide', canThink);
+    el('thinkBoolWrap').classList.toggle('hide', !(canThink && !isGptOss));
+    el('thinkLevelWrap').classList.toggle('hide', !(canThink && isGptOss));
+
+    if (activeSession) {
+      if (canThink && !isGptOss) {
+        const enabled = !!activeSession.thinkEnabled;
+        el('thinkToggle').textContent = 'Thinking: ' + (enabled ? 'on' : 'off');
       }
-      div.appendChild(strip);
+      if (canThink && isGptOss) {
+        el('thinkLevel').value = activeSession.thinkLevel || 'low';
+      }
+      const st = (activeSession.showThinkingTrace !== false);
+      el('showThinkingToggle').textContent = 'Show trace: ' + (st ? 'on' : 'off');
+      el('showThinkingToggle2').textContent = 'Show trace: ' + (st ? 'on' : 'off');
     }
-    return div;
   }
 
-  async function renderChat(){
-    const chat = $("chat");
-    chat.innerHTML = "";
-    if (!currentSessionId) return;
-    const msgs = await getMessages(currentSessionId);
-    for (const m of msgs) chat.appendChild(msgEl(m));
+  function setComposerHint(){
+    if (!activeSession) { el('composerHint').textContent = 'Create/select a session to chat.'; return; }
+    const m = el('modelSelect').value;
+    if (!m) { el('composerHint').textContent = 'Select a model.'; return; }
+    const caps = capsFor(m);
+    const parts = [];
+    if (caps.includes('vision')) parts.push('vision');
+    if (caps.includes('thinking')) parts.push('thinking');
+    el('composerHint').textContent = parts.length ? `Model supports: ${parts.join(', ')}` : 'Model loaded.';
+  }
+
+  // Rendering
+  function renderSessions(items){
+    const host = el('sessions');
+    host.innerHTML = '';
+    items.forEach(sess => {
+      const div = document.createElement('div');
+      div.className = 'session-item' + (sess.id === activeSessionId ? ' active':'');
+      div.onclick = async () => { await loadSession(sess.id); closeSidebar(); };
+
+      const title = document.createElement('div');
+      title.className = 'session-title';
+      title.textContent = sess.title || 'Untitled';
+
+      const meta = document.createElement('div');
+      meta.className = 'session-meta';
+      const model = sess.model || '(no model)';
+      const t = new Date(sess.updatedAt || sess.createdAt || Date.now()).toLocaleString();
+      meta.textContent = `${model} · ${t}`;
+
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.style.justifyContent = 'space-between';
+
+      const del = document.createElement('button');
+      del.className = 'btn danger';
+      del.textContent = 'Delete';
+      del.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm('Delete this session (client-side)?')) return;
+        await delSession(sess.id);
+        if (activeSessionId === sess.id) {
+          activeSessionId = null;
+          activeSession = null;
+          activeMessages = [];
+          el('sessionTitle').textContent = 'No session';
+          renderChat();
+        }
+        await refreshSessions();
+      };
+
+      row.appendChild(title);
+      row.appendChild(del);
+      div.appendChild(row);
+      div.appendChild(meta);
+      host.appendChild(div);
+    });
+  }
+
+  function renderChat(){
+    const chat = el('chat');
+    chat.innerHTML = '';
+    activeMessages.forEach(m => {
+      const msg = document.createElement('div');
+      msg.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const ts = new Date(m.ts).toLocaleTimeString();
+      meta.textContent = `${m.role} · ${ts}`;
+      msg.appendChild(meta);
+
+      const body = document.createElement('div');
+      body.textContent = m.content || '';
+      msg.appendChild(body);
+
+      if (m.images && m.images.length) {
+        const grid = document.createElement('div');
+        grid.className = 'imggrid';
+        m.images.forEach(url => {
+          const im = document.createElement('img');
+          im.src = url;
+          im.alt = 'image';
+          grid.appendChild(im);
+        });
+        msg.appendChild(grid);
+      }
+
+      const showTrace = activeSession ? (activeSession.showThinkingTrace !== false) : true;
+      if (showTrace && m.thinking) {
+        const th = document.createElement('div');
+        th.className = 'thinking';
+        th.textContent = m.thinking;
+        msg.appendChild(th);
+      }
+
+      chat.appendChild(msg);
+    });
     chat.scrollTop = chat.scrollHeight;
   }
 
-  async function selectSession(id){
-    currentSessionId = id;
-    renderSessions(await listSessions());
-    await renderChat();
-    // sync model selector to session
-    const ss = await listSessions();
-    const cur = ss.find(x => x.id === currentSessionId);
-    if (cur?.model){
-      q("modelSelect").value = cur.model;
-    }
-  }
+  // Model loading
+  async function refreshModels(){
+    setStatus('Loading models…');
+    const data = await api('/api/models');
+    MODELS = data.models || [];
+    MODEL_BY_NAME = new Map(MODELS.map(m => [m.name, m]));
 
-  async function createNewSession(model){
-    const id = uuidv4();
-    const s = { id, title:"New session", model, createdAt:Date.now(), updatedAt:Date.now() };
-    await putSession(s);
-    currentSessionId = id;
-    renderSessions(await listSessions());
-    await renderChat();
-  }
-
-  async function deleteCurrentSession(){
-    if (!currentSessionId) return;
-    await deleteSession(currentSessionId);
-    currentSessionId = null;
-    const ss = await listSessions();
-    renderSessions(ss);
-    if (ss.length) await selectSession(ss[0].id);
-    else $("chat").innerHTML = "";
-  }
-
-  function setAttachUI(){
-    const strip = $("attachStrip");
-    strip.innerHTML = "";
-    for (const a of attached){
-      const img = document.createElement("img");
-      img.className = "thumb";
-      img.src = a.dataUrl;
-      strip.appendChild(img);
-    }
-    $("fileNote").textContent = attached.length ? `${attached.length} image(s) attached.` : "No images attached.";
-  }
-
-  async function fileToDownscaledBase64(file, maxSide=1024, quality=0.86){
-    const dataUrl = await new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(r.result);
-      r.onerror = () => reject(r.error);
-      r.readAsDataURL(file);
+    const sel = el('modelSelect');
+    const current = sel.value || (activeSession && activeSession.model) || '';
+    sel.innerHTML = '';
+    MODELS.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.name;
+      sel.appendChild(opt);
     });
 
-    const img = await new Promise((resolve, reject) => {
-      const i = new Image();
-      i.onload = () => resolve(i);
-      i.onerror = () => reject(new Error("image_decode_failed"));
-      i.src = dataUrl;
-    });
+    const pick = (activeSession && activeSession.model && MODEL_BY_NAME.has(activeSession.model))
+      ? activeSession.model
+      : (MODEL_BY_NAME.has(current) ? current : (MODELS[0] ? MODELS[0].name : ''));
 
-    const w = img.width, h = img.height;
-    const scale = Math.min(1, maxSide / Math.max(w,h));
-    const cw = Math.max(1, Math.round(w * scale));
-    const ch = Math.max(1, Math.round(h * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = cw; canvas.height = ch;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0, cw, ch);
+    sel.value = pick;
+    if (activeSession) {
+      activeSession.model = pick;
+      activeSession.updatedAt = Date.now();
+      await putSession(activeSession);
+    }
 
-    const outDataUrl = canvas.toDataURL("image/jpeg", quality);
-    const b64 = outDataUrl.split(",")[1] || "";
-    return { name:file.name, mime:"image/jpeg", b64, dataUrl: outDataUrl };
+    applyModelUI();
+    setComposerHint();
+    setStatus(`Loaded ${MODELS.length} model(s).`);
   }
 
-  $("file").onchange = async (ev) => {
-    const files = Array.from(ev.target.files || []);
-    attached = [];
-    for (const f of files.slice(0,4)){
-      try{
-        if (f.size > 8*1024*1024){ toast(`Skipping ${f.name}: too large`); continue; }
-        attached.push(await fileToDownscaledBase64(f, 1024, 0.86));
-      } catch { toast(`Failed to attach ${f.name}`); }
-    }
-    setAttachUI();
-    $("file").value = "";
+  el('refreshModels').onclick = async () => { try { await refreshModels(); } catch(e){ setStatus('Model refresh failed: ' + e.message); } };
+
+  el('modelSelect').onchange = async () => {
+    if (!activeSession) { applyModelUI(); setComposerHint(); return; }
+    activeSession.model = el('modelSelect').value;
+    activeSession.updatedAt = Date.now();
+    await putSession(activeSession);
+    applyModelUI();
+    setComposerHint();
+    await refreshSessions();
   };
 
-  // Ollama
-  async function loadOllamaVersion(){
-    try{
-      const r = await api("/ollama/version");
-      if (!r.ok){ setOllama(false, "ollama: error"); return; }
-      const d = await r.json();
-      setOllama(true, "ollama: " + (d.version || "?"));
-    } catch { setOllama(false, "ollama: offline"); }
-  }
+  // Thinking controls
+  el('thinkToggle').onclick = async () => {
+    if (!activeSession) return;
+    activeSession.thinkEnabled = !activeSession.thinkEnabled;
+    activeSession.updatedAt = Date.now();
+    await putSession(activeSession);
+    el('thinkToggle').textContent = 'Thinking: ' + (activeSession.thinkEnabled ? 'on' : 'off');
+    await refreshSessions();
+    renderChat();
+  };
+  el('showThinkingToggle').onclick = async () => {
+    if (!activeSession) return;
+    activeSession.showThinkingTrace = !(activeSession.showThinkingTrace !== false);
+    activeSession.updatedAt = Date.now();
+    await putSession(activeSession);
+    const st = (activeSession.showThinkingTrace !== false);
+    el('showThinkingToggle').textContent = 'Show trace: ' + (st ? 'on':'off');
+    el('showThinkingToggle2').textContent = el('showThinkingToggle').textContent;
+    renderChat();
+  };
+  el('showThinkingToggle2').onclick = el('showThinkingToggle').onclick;
 
-  async function loadModels(){
-    q("modelHint").textContent = "Loading models…";
-    try{
-      const r = await api("/ollama/tags");
-      if (!r.ok){
-        q("modelHint").textContent = "Model load failed";
-        return;
-      }
-      const d = await r.json();
-      const models = (d.models || []).map(m => m.name).sort();
-      const sel = q("modelSelect");
-      sel.innerHTML = "";
-      for (const name of models){
-        const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = name;
-        sel.appendChild(opt);
-      }
-      q("modelHint").textContent = models.length ? `${models.length} model(s)` : "No models found.";
+  el('thinkLevel').onchange = async () => {
+    if (!activeSession) return;
+    activeSession.thinkLevel = el('thinkLevel').value || 'low';
+    activeSession.updatedAt = Date.now();
+    await putSession(activeSession);
+    await refreshSessions();
+  };
 
-      const ss = await listSessions();
-      if (!ss.length && models.length){
-        await createNewSession(models[0]);
-      } else if (ss.length && !currentSessionId){
-        await selectSession(ss[0].id);
-      }
+  // Sessions
+  async function refreshSessions(){ renderSessions(await listSessions()); }
 
-      if (currentSessionId){
-        const ss2 = await listSessions();
-        const cur = ss2.find(x => x.id === currentSessionId);
-        if (cur?.model) sel.value = cur.model;
-        else if (models.length){
-          sel.value = models[0];
-          if (cur){
-            cur.model = models[0];
-            cur.updatedAt = Date.now();
-            await putSession(cur);
-            renderSessions(await listSessions());
-          }
-        }
-      }
-    } catch {
-      q("modelHint").textContent = "Failed to load models.";
-    }
-  }
-
-  async function readNdjsonStream(resp, onObj){
-    if (!resp.body || !resp.body.getReader){
-      const text = await resp.text();
-      for (const line of text.split("\n")){
-        const s = line.trim();
-        if (!s) continue;
-        try{ onObj(JSON.parse(s)); } catch {}
-      }
-      return;
-    }
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder("utf-8");
-    let buf = "";
-    while (true){
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream:true });
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0){
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx+1);
-        if (!line) continue;
-        try{ onObj(JSON.parse(line)); } catch {}
-      }
-    }
-    const tail = buf.trim();
-    if (tail){
-      try{ onObj(JSON.parse(tail)); } catch {}
-    }
-  }
-
-  function optionsFromUI(){
-    const t = parseFloat(q("temp").value || "0.7");
-    const tp = parseFloat(q("topP").value || "0.9");
-    const np = parseInt(q("numPredict").value || "512", 10);
-    const o = {};
-    if (!isNaN(t)) o.temperature = t;
-    if (!isNaN(tp)) o.top_p = tp;
-    if (!isNaN(np)) o.num_predict = np;
-    return o;
-  }
-
-  async function send(){
-    if (!currentSessionId){ toast("No session selected"); return; }
-
-    const mode = q("modeSelect").value;
-    const model = q("modelSelect").value;
-    const sys = (q("systemPrompt").value || "").trim();
-    const input = $("input");
-    const text = input.value;
-
-    if (!text.trim() && !attached.length){
-      toast("Nothing to send");
-      return;
-    }
-
-    // persist user message
-    const userMsg = {
-      sessionId: currentSessionId,
-      role: "user",
-      content: text,
-      ts: Date.now(),
-      images: attached.map(x => ({ name:x.name, mime:x.mime, b64:x.b64, dataUrl:x.dataUrl })),
+  async function createSession(){
+    const user = localStorage.getItem(USER_KEY) || '';
+    const id = uuidv4();
+    const now = Date.now();
+    const firstModel = (MODELS[0] && MODELS[0].name) ? MODELS[0].name : '';
+    const sess = {
+      id, user,
+      title: 'New chat',
+      createdAt: now,
+      updatedAt: now,
+      model: firstModel,
+      thinkEnabled: false,
+      thinkLevel: 'low',
+      showThinkingTrace: true
     };
-    input.value = "";
-    attached = [];
-    setAttachUI();
+    await putSession(sess);
+    await refreshSessions();
+    await loadSession(id);
+  }
+
+  el('newSession').onclick = async () => { if (!MODELS.length) await refreshModels(); await createSession(); closeSidebar(); };
+
+  async function loadSession(id){
+    const items = await listSessions();
+    const sess = items.find(s => s.id === id);
+    if (!sess) return;
+    activeSessionId = id;
+    activeSession = sess;
+    el('sessionTitle').textContent = clampTitle(sess.title || 'Session');
+    if (sess.model && MODEL_BY_NAME.has(sess.model)) el('modelSelect').value = sess.model;
+    applyModelUI();
+    setComposerHint();
+    activeMessages = await listMessages(id);
+    renderChat();
+    await refreshSessions();
+  }
+
+  // Composer
+  function resetComposer(){
+    el('prompt').value = '';
+    pendingImages = [];
+    el('fileInput').value = '';
+  }
+
+  el('attachBtn').onclick = () => el('fileInput').click();
+
+  el('fileInput').onchange = async () => {
+    if (!activeSession) return;
+    const model = el('modelSelect').value;
+    if (!hasCap(model, 'vision')) { alert('This model does not advertise vision capability.'); el('fileInput').value=''; return; }
+
+    const files = el('fileInput').files;
+    if (!files || !files.length) return;
+
+    for (const f of files) {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+      const b64 = btoa(bin);
+      const dataUrl = `data:${f.type || 'image/png'};base64,${b64}`;
+      pendingImages.push({ dataUrl, b64 });
+    }
+    setStatus(`Attached ${pendingImages.length} image(s).`);
+  };
+
+  function inferTitleFrom(text){
+    const t = (text || '').trim().split('\n')[0].slice(0,40);
+    return t || 'New chat';
+  }
+
+  async function sendMessage(){
+    if (!activeSession) { openSidebar(); return; }
+    const model = el('modelSelect').value;
+    if (!model) { openSidebar(); return; }
+
+    const content = el('prompt').value.trim();
+    if (!content && !pendingImages.length) return;
+
+    const now = Date.now();
+
+    const userMsg = {
+      id: uuidv4(),
+      user: localStorage.getItem(USER_KEY) || '',
+      sessionId: activeSessionId,
+      ts: now,
+      role: 'user',
+      content: content,
+      thinking: '',
+      images: pendingImages.map(x => x.dataUrl)
+    };
+    activeMessages.push(userMsg);
     await addMessage(userMsg);
 
-    // update session meta
-    const ss = await listSessions();
-    const cur = ss.find(x => x.id === currentSessionId);
-    if (cur){
-      cur.model = model;
-      cur.updatedAt = Date.now();
-      if (cur.title === "New session") cur.title = (text.trim() || "Image").slice(0,40) || "Session";
-      await putSession(cur);
-    }
-    renderSessions(await listSessions());
-    await renderChat();
+    if ((activeSession.title || 'New chat') === 'New chat') activeSession.title = inferTitleFrom(content);
+    activeSession.updatedAt = now;
+    await putSession(activeSession);
 
-    // stop previous
-    if (aborter) aborter.abort();
-    aborter = new AbortController();
+    const asstId = uuidv4();
+    const asstMsg = {
+      id: asstId,
+      user: localStorage.getItem(USER_KEY) || '',
+      sessionId: activeSessionId,
+      ts: now + 1,
+      role: 'assistant',
+      content: '',
+      thinking: '',
+      images: []
+    };
+    activeMessages.push(asstMsg);
+    await addMessage(asstMsg);
 
-    setStatus("sending…");
+    renderChat();
+    resetComposer();
 
-    // assistant placeholder
-    const assistant = { sessionId: currentSessionId, role:"assistant", content:"", ts: Date.now(), images: [] };
-    const assistantId = await addMessage(assistant);
-    await renderChat();
+    // Build messages for Ollama (include images on last user message only)
+    const messages = activeMessages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: m.content || '' }));
 
-    function updateAssistantText(s){
-      updateMessage(assistantId, { content: s });
-      const chat = $("chat");
-      const last = chat.lastElementChild;
-      if (last){
-        const contentEl = last.querySelector(".content");
-        if (contentEl) contentEl.textContent = s;
+    if (userMsg.images && userMsg.images.length) {
+      const lastUserIdx = (() => {
+        for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'user') return i;
+        return -1;
+      })();
+      if (lastUserIdx >= 0) {
+        const b64s = (userMsg.images || []).map(u => (u.split('base64,')[1] || '')).filter(Boolean);
+        messages[lastUserIdx].images = b64s;
       }
-      chat.scrollTop = chat.scrollHeight;
     }
+
+    // Thinking setting
+    const caps = capsFor(model);
+    const canThink = caps.includes('thinking');
+    const isGptOss = (model || '').toLowerCase().includes('gpt-oss');
+    let think = undefined;
+    if (canThink) think = isGptOss ? (activeSession.thinkLevel || 'low') : !!activeSession.thinkEnabled;
 
     try{
-      if (mode === "embed"){
-        const body = { model, prompt: text.trim() };
-        const r = await api("/ollama/embeddings", {
-          method:"POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify(body),
-          signal: aborter.signal
-        });
-        if (!r.ok) throw new Error(await r.text());
-        const d = await r.json();
-        updateAssistantText(JSON.stringify(d, null, 2));
-        setStatus("idle");
-        return;
-      }
+      setStatus('Streaming…');
 
-      if (mode === "generate"){
-        const body = { model, prompt: text, stream:true, options: optionsFromUI() };
-        if (sys) body.system = sys;
-        const r = await api("/ollama/generate", {
-          method:"POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify(body),
-          signal: aborter.signal
-        });
-        if (!r.ok) throw new Error(await r.text());
+      const payload = { model, messages, stream: true };
+      if (think !== undefined) payload.think = think;
 
-        let acc = "";
-        await readNdjsonStream(r, (obj) => {
-          if (obj?.response){
-            acc += obj.response;
-            updateAssistantText(acc);
-          }
-          if (obj?.error) throw new Error(obj.error);
-        });
-        setStatus("idle");
-        return;
-      }
-
-      // chat mode
-      const msgs = await getMessages(currentSessionId);
-      const out = [];
-      if (sys) out.push({ role:"system", content: sys });
-
-      for (const m of msgs){
-        if (m.id === assistantId) continue; // skip placeholder
-        const o = { role: m.role, content: (m.content || "") };
-        if (m.role === "user" && m.images && m.images.length){
-          o.images = m.images.map(x => x.b64);
-        }
-        out.push(o);
-      }
-
-      const body = { model, messages: out, stream:true, options: optionsFromUI() };
-      const r = await api("/ollama/chat", {
-        method:"POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify(body),
-        signal: aborter.signal
+      const res = await fetch('/api/ollama/chat', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + getToken() },
+        body: JSON.stringify(payload)
       });
-      if (!r.ok) throw new Error(await r.text());
 
-      let acc = "";
-      await readNdjsonStream(r, (obj) => {
-        const chunk = obj?.message?.content || "";
-        if (chunk){
-          acc += chunk;
-          updateAssistantText(acc);
+      if (!res.ok) {
+        const t = await res.text();
+        let j=null; try{ j=JSON.parse(t);}catch{}
+        throw new Error((j && (j.error||j.message)) ? (j.error||j.message) : (t || `HTTP ${res.status}`));
+      }
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+
+      while(true){
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream:true});
+
+        let idx;
+        while((idx = buf.indexOf('\n')) >= 0){
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          let obj=null; try{ obj=JSON.parse(line);}catch{continue;}
+
+          const part = (obj.message && obj.message.content) ? obj.message.content : '';
+          const thinkPart = (obj.message && obj.message.thinking) ? obj.message.thinking : '';
+          if (part) asstMsg.content += part;
+          if (thinkPart) asstMsg.thinking += thinkPart;
+          renderChat();
         }
-        if (obj?.error) throw new Error(obj.error);
-      });
-      setStatus("idle");
-    } catch(e){
-      setStatus("error");
-      const msg = "Error: " + (e?.message || e);
-      updateAssistantText(msg);
-      toast(msg);
+      }
+
+      asstMsg.ts = Date.now();
+      await addMessage(asstMsg);
+      activeSession.updatedAt = Date.now();
+      await putSession(activeSession);
+
+      setStatus('Done.');
+      await refreshSessions();
+      renderChat();
+    }catch(e){
+      setStatus('Error: ' + e.message);
+      asstMsg.content += `\n\n[error] ${e.message}`;
+      await addMessage(asstMsg);
+      renderChat();
     }
   }
 
-  function stop(){
-    if (aborter) aborter.abort();
-    setStatus("stopped");
-    toast("Stopped");
-  }
-
-  $("sendBtn").onclick = send;
-  $("stopBtn").onclick = stop;
-  $("input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey){
-      e.preventDefault();
-      send();
-    }
+  el('sendBtn').onclick = sendMessage;
+  el('prompt').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
 
-  // Auth modal
-  function openAuthModal(){ $("authModal").classList.add("open"); }
-  function closeAuthModal(){ $("authModal").classList.remove("open"); }
-  function showPane(which){
-    $("loginPane").style.display = (which==="login") ? "flex" : "none";
-    $("signupPane").style.display = (which==="signup") ? "flex" : "none";
-  }
-  $("tabLogin").onclick = () => showPane("login");
-  $("tabSignup").onclick = () => showPane("signup");
-  showPane("login");
-
-  async function doLogin(username, password){
-    const r = await fetch("/auth/login", {
-      method:"POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ username, password })
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || "login_failed");
-    setToken(d.token);
-  }
-
-  async function doSignup(username, password){
-    const r = await fetch("/auth/signup", {
-      method:"POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ username, password })
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || "signup_failed");
-  }
-
-  $("loginBtn").onclick = async () => {
-    $("loginMsg").textContent = "…";
-    try{
-      await doLogin($("loginUser").value, $("loginPass").value);
-      $("loginMsg").textContent = "Logged in.";
-      await bootAuthed();
-      closeAuthModal();
-    } catch(e){
-      $("loginMsg").textContent = "Login error: " + (e?.message || e);
-    }
-  };
-
-  $("signupBtn").onclick = async () => {
-    $("signupMsg").textContent = "…";
-    try{
-      await doSignup($("signupUser").value, $("signupPass").value);
-      await doLogin($("signupUser").value, $("signupPass").value);
-      $("signupMsg").textContent = "Account created + logged in.";
-      await bootAuthed();
-      closeAuthModal();
-    } catch(e){
-      $("signupMsg").textContent = "Signup error: " + (e?.message || e);
-    }
-  };
-
-  $("logoutBtn").onclick = async () => {
-    try{ await api("/auth/logout", { method:"POST" }); } catch {}
-    clearToken();
-    setAuth(false, "logged out");
-    toast("Logged out");
-    openAuthModal();
-  };
-
-  // Wire sidebar (duplicated IDs -> use q())
-  function wireSidebar(){
-    q("refreshModelsBtn").onclick = async () => { await loadModels(); await loadOllamaVersion(); toast("Refreshed"); };
-    q("newSessionBtn").onclick = async () => {
-      const model = q("modelSelect").value || "";
-      await createNewSession(model);
-      toast("New session created");
-      closeSide();
-    };
-    q("delSessionBtn").onclick = async () => { await deleteCurrentSession(); toast("Session deleted"); closeSide(); };
-
-    q("modelSelect").onchange = async () => {
-      if (!currentSessionId) return;
-      const ss = await listSessions();
-      const cur = ss.find(x => x.id === currentSessionId);
-      if (cur){
-        cur.model = q("modelSelect").value;
-        cur.updatedAt = Date.now();
-        await putSession(cur);
-        renderSessions(await listSessions());
-      }
-    };
-  }
-
-  async function bootAuthed(){
-    const me = await whoAmI();
-    if (!me){
-      setAuth(false, "logged out");
-      openAuthModal();
-      return;
-    }
-    setAuth(true, "user: " + (me.username || "?"));
-    await loadOllamaVersion();
-    await loadModels();
-
-    const ss = await listSessions();
-    renderSessions(ss);
-    if (ss.length){
-      if (!currentSessionId) await selectSession(ss[0].id);
-    } else {
-      const ms = Array.from(q("modelSelect").options).map(o => o.value);
-      if (ms.length) await createNewSession(ms[0]);
-    }
-  }
-
+  // Boot
   async function boot(){
-    mountSidebar();
-    wireSidebar();
-    setAttachUI();
-    const me = await whoAmI();
-    if (!me){
-      setAuth(false, "logged out");
-      openAuthModal();
-      return;
-    }
-    setAuth(true, "user: " + (me.username || "?"));
-    await bootAuthed();
+    const me = await whoami();
+    if (!me){ showAuthModal(true); return; }
+    showAuthModal(false);
+    await refreshModels();
+    await refreshSessions();
+    const sessions = await listSessions();
+    if (sessions.length) await loadSession(sessions[0].id);
+    else await createSession();
+    applyModelUI();
+    setComposerHint();
   }
 
-  window.addEventListener("resize", () => { try{ wireSidebar(); } catch {} });
-
-  boot();
+  (async () => { if (!getToken()) showAuthModal(true); await boot(); })();
 })();
 </script>
 </body>
 </html>
 """
 
+# =========================
+# HTTP handlers
+# =========================
 
-# ==========================
-# HTTP server
-# ==========================
+@web.middleware
+async def security_headers(request: web.Request, handler):
+    resp: web.StreamResponse = await handler(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
-class AppServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_cls, conn, ollama_base, max_body):
-        super().__init__(server_address, handler_cls)
-        self.db = conn
-        self.ollama_base = ollama_base
-        self.max_body = max_body
+async def require_auth(request: web.Request) -> Tuple[int, str]:
+    auth = request.headers.get("Authorization", "")
+    token = ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    if not token:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Missing token"}), content_type="application/json")
+    user = get_user_by_token(token)
+    if not user:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Invalid token"}), content_type="application/json")
+    return user
 
+async def read_json_limited(request: web.Request) -> Dict[str, Any]:
+    raw = await request.read()
+    if len(raw) > MAX_JSON_BODY:
+        raise web.HTTPRequestEntityTooLarge(text=json.dumps({"error": "Body too large"}), content_type="application/json")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Invalid JSON"}), content_type="application/json")
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+async def index(request: web.Request) -> web.Response:
+    return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
 
-    def _headers_common(self) -> Dict[str, str]:
-        return {
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "Referrer-Policy": "no-referrer",
-        }
+# auth
+async def auth_signup(request: web.Request) -> web.Response:
+    data = await read_json_limited(request)
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    try:
+        create_user(username, password)
+        return web.json_response({"ok": True})
+    except ValueError as e:
+        raise web.HTTPBadRequest(text=json.dumps({"error": str(e)}), content_type="application/json")
 
-    def _send(self, code: int, ctype: str, data: bytes, extra: Optional[Dict[str, str]] = None) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        for k, v in self._headers_common().items():
-            self.send_header(k, v)
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(data)
+async def auth_login(request: web.Request) -> web.Response:
+    data = await read_json_limited(request)
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    uid = verify_user(username, password)
+    if not uid:
+        raise web.HTTPUnauthorized(text=json.dumps({"error": "Invalid credentials"}), content_type="application/json")
+    token = new_session_token(uid)
+    return web.json_response({"token": token, "username": username})
 
-    def _json(self, code: int, obj: Any) -> None:
-        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._send(code, "application/json; charset=utf-8", data)
+async def auth_me(request: web.Request) -> web.Response:
+    uid, username = await require_auth(request)
+    return web.json_response({"id": uid, "username": username})
 
-    def _read_body(self) -> bytes:
+# models (capabilities-enriched)
+async def api_models(request: web.Request) -> web.Response:
+    await require_auth(request)
+    async with aiohttp.ClientSession() as session:
+        models = await get_models_with_capabilities(session)
+        return web.json_response({"models": models})
+
+# safe proxy endpoints
+async def ollama_tags(request: web.Request) -> web.Response:
+    await require_auth(request)
+    async with aiohttp.ClientSession() as session:
+        data = await ollama_fetch_json(session, "GET", "/api/tags", None)
+        return web.json_response(data)
+
+async def ollama_show(request: web.Request) -> web.Response:
+    await require_auth(request)
+    data = await read_json_limited(request)
+    model = (data.get("model") or "").strip()
+    if not model:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Missing model"}), content_type="application/json")
+    async with aiohttp.ClientSession() as session:
+        out = await ollama_fetch_json(session, "POST", "/api/show", {"model": model})
+        return web.json_response(out)
+
+async def _proxy_stream(request: web.Request, ollama_path: str, payload: Dict[str, Any]) -> web.StreamResponse:
+    async with aiohttp.ClientSession() as session:
+        url = f"{OLLAMA_BASE}{ollama_path}"
+        async with session.post(url, json=payload, timeout=None) as resp:
+            if resp.status >= 400:
+                txt = await resp.text()
+                try:
+                    j = json.loads(txt) if txt else {}
+                except Exception:
+                    j = {"error": txt}
+                raise web.HTTPBadRequest(text=json.dumps({"error": j.get("error", f"Ollama error {resp.status}")}),
+                                         content_type="application/json")
+            out = web.StreamResponse(status=200)
+            out.content_type = "application/x-ndjson"
+            await out.prepare(request)
+            async for chunk in resp.content.iter_chunked(4096):
+                await out.write(chunk)
+            await out.write_eof()
+            return out
+
+async def ollama_chat(request: web.Request) -> web.StreamResponse:
+    await require_auth(request)
+    data = await read_json_limited(request)
+
+    model = (data.get("model") or "").strip()
+    if not model:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Missing model"}), content_type="application/json")
+
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "messages must be a non-empty list"}), content_type="application/json")
+
+    # Enforce image gating
+    async with aiohttp.ClientSession() as session:
+        caps = await model_capabilities(session, model)
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            imgs = msg.get("images")
+            if imgs:
+                if "vision" not in caps:
+                    raise web.HTTPBadRequest(text=json.dumps({"error": "Model does not support images (vision missing)."}),
+                                             content_type="application/json")
+                if not isinstance(imgs, list):
+                    raise web.HTTPBadRequest(text=json.dumps({"error": "images must be a list"}), content_type="application/json")
+                clean = []
+                for b in imgs:
+                    if not isinstance(b, str):
+                        continue
+                    s = _strip_data_url(b)
+                    if len(s) > MAX_IMAGE_B64_BYTES:
+                        raise web.HTTPRequestEntityTooLarge(text=json.dumps({"error": "Image too large"}),
+                                                            content_type="application/json")
+                    # mild validation
+                    try:
+                        base64.b64decode(s[:128] + "==", validate=False)
+                    except Exception:
+                        pass
+                    clean.append(s)
+                msg["images"] = clean
+
+    payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": bool(data.get("stream", True))}
+    if "think" in data:
+        payload["think"] = data["think"]
+    if "options" in data and isinstance(data["options"], dict):
+        payload["options"] = data["options"]
+    if "format" in data:
+        payload["format"] = data["format"]
+    if "keep_alive" in data:
+        payload["keep_alive"] = data["keep_alive"]
+    if "tools" in data:
+        payload["tools"] = data["tools"]
+
+    return await _proxy_stream(request, "/api/chat", payload)
+
+async def ollama_generate(request: web.Request) -> web.StreamResponse:
+    await require_auth(request)
+    data = await read_json_limited(request)
+    model = (data.get("model") or "").strip()
+    if not model:
+        raise web.HTTPBadRequest(text=json.dumps({"error": "Missing model"}), content_type="application/json")
+
+    payload: Dict[str, Any] = {"model": model, "prompt": data.get("prompt", ""), "stream": bool(data.get("stream", True))}
+    if "options" in data and isinstance(data["options"], dict):
+        payload["options"] = data["options"]
+    if "think" in data:
+        payload["think"] = data["think"]
+    for k in ("suffix", "system", "template", "format", "keep_alive", "raw"):
+        if k in data:
+            payload[k] = data[k]
+
+    return await _proxy_stream(request, "/api/generate", payload)
+
+async def ollama_embed(request: web.Request) -> web.Response:
+    await require_auth(request)
+    data = await read_json_limited(request)
+    async with aiohttp.ClientSession() as session:
+        out = await ollama_fetch_json(session, "POST", "/api/embed", data)
+        return web.json_response(out)
+
+def make_app() -> web.Application:
+    app = web.Application(client_max_size=MAX_JSON_BODY + 4096, middlewares=[security_headers])
+    app.router.add_get("/", index)
+
+    app.router.add_post("/api/auth/signup", auth_signup)
+    app.router.add_post("/api/auth/login", auth_login)
+    app.router.add_get("/api/auth/me", auth_me)
+
+    app.router.add_get("/api/models", api_models)
+
+    app.router.add_get("/api/ollama/tags", ollama_tags)
+    app.router.add_post("/api/ollama/show", ollama_show)
+    app.router.add_post("/api/ollama/chat", ollama_chat)
+    app.router.add_post("/api/ollama/generate", ollama_generate)
+    app.router.add_post("/api/ollama/embed", ollama_embed)
+    return app
+
+# =========================
+# Programmatic start + UPnP
+# =========================
+
+async def start_aiohttp(app: web.Application, host: str, port: int) -> Tuple[web.AppRunner, web.TCPSite, int]:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=host, port=port, shutdown_timeout=2.0)
+    await site.start()
+
+    # Retrieve bound port if port==0
+    bound_port = port
+    # site._server is an asyncio.Server
+    srv = getattr(site, "_server", None)
+    if srv and srv.sockets:
+        bound_port = int(srv.sockets[0].getsockname()[1])
+
+    return runner, site, bound_port
+
+async def upnp_map_random(local_ip: str, local_port: int, desc: str, lease: int, retries: int = 12) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
+    """
+    Returns: (external_ip, external_port, control_url, service_type)
+    """
+    def _work() -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
+        location = ssdp_discover(timeout=3.0)
+        if not location:
+            return None, None, None, None
+        control_url, service_type = find_igd_control_url(location)
+        if not control_url or not service_type:
+            return None, None, None, None
+
+        ext_ip = get_external_ip(control_url, service_type)
+
+        # random external port; retry on conflict
+        for _ in range(retries):
+            ext_port = random.randint(20000, 60000)
+            try:
+                add_port_mapping(control_url, service_type, ext_port, local_ip, local_port, desc, lease)
+                return ext_ip, ext_port, control_url, service_type
+            except Exception:
+                continue
+        return ext_ip, None, control_url, service_type
+
+    return await asyncio.to_thread(_work)
+
+async def upnp_unmap(control_url: str, service_type: str, external_port: int) -> None:
+    def _work():
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length > self.server.max_body:
-            raise ValueError("body_too_large")
-        return self.rfile.read(length) if length else b""
-
-    def _read_json(self) -> Dict[str, Any]:
-        raw = self._read_body()
-        try:
-            return json.loads(raw.decode("utf-8", errors="strict") or "{}")
-        except Exception:
-            raise ValueError("bad_json")
-
-    def _bearer_token(self) -> str:
-        h = self.headers.get("Authorization", "")
-        if h.lower().startswith("bearer "):
-            return h.split(" ", 1)[1].strip()
-        return ""
-
-    def _require_session(self) -> sqlite3.Row:
-        token = self._bearer_token()
-        row = get_session(self.server.db, token)
-        if not row:
-            raise PermissionError("unauthorized")
-        return row
-
-    # Chunked streaming
-    def _start_chunked(self, status: int, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Transfer-Encoding", "chunked")
-        for k, v in self._headers_common().items():
-            self.send_header(k, v)
-        if extra:
-            for k, v in extra.items():
-                self.send_header(k, v)
-        self.end_headers()
-
-    def _write_chunk(self, data: bytes) -> None:
-        if not data:
-            return
-        self.wfile.write(("%X\r\n" % len(data)).encode("ascii"))
-        self.wfile.write(data)
-        self.wfile.write(b"\r\n")
-        self.wfile.flush()
-
-    def _end_chunked(self) -> None:
-        try:
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            delete_port_mapping(control_url, service_type, external_port)
         except Exception:
             pass
+    await asyncio.to_thread(_work)
 
-    def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
+async def main_async():
+    db_init()
 
-        if path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", INDEX_HTML.encode("utf-8"))
-            return
-
-        if path == "/health":
-            self._send(200, "text/plain; charset=utf-8", b"ok\n")
-            return
-
-        if path == "/auth/me":
-            try:
-                s = self._require_session()
-                self._json(200, {"username": s["username"]})
-            except PermissionError:
-                self._json(401, {"error": "unauthorized"})
-            return
-
-        if path == "/ollama/tags":
-            return self._ollama_simple("GET", "/api/tags")
-
-        if path == "/ollama/version":
-            return self._ollama_simple("GET", "/api/version")
-
-        self._send(404, "text/plain; charset=utf-8", b"not found\n")
-
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == "/auth/signup":
-            try:
-                obj = self._read_json()
-                username = str(obj.get("username", "")).strip()
-                password = str(obj.get("password", ""))
-                create_user(self.server.db, username, password)
-                self._json(200, {"ok": True})
-            except ValueError as e:
-                self._json(400, {"error": str(e)})
-            except sqlite3.IntegrityError:
-                self._json(409, {"error": "username_taken"})
-            except Exception:
-                self._json(500, {"error": "server_error"})
-            return
-
-        if path == "/auth/login":
-            try:
-                obj = self._read_json()
-                username = str(obj.get("username", "")).strip()
-                password = str(obj.get("password", ""))
-                uid = verify_user(self.server.db, username, password)
-                if not uid:
-                    self._json(401, {"error": "bad_credentials"})
-                    return
-                token = new_session(self.server.db, uid)
-                self._json(200, {"token": token})
-            except ValueError as e:
-                self._json(400, {"error": str(e)})
-            except Exception:
-                self._json(500, {"error": "server_error"})
-            return
-
-        if path == "/auth/logout":
-            token = self._bearer_token()
-            if token:
-                delete_session(self.server.db, token)
-            self._json(200, {"ok": True})
-            return
-
-        if path == "/ollama/chat":
-            try:
-                s = self._require_session()
-            except PermissionError:
-                self._json(401, {"error": "unauthorized"})
-                return
-            return self._ollama_stream("POST", "/api/chat", s)
-
-        if path == "/ollama/generate":
-            try:
-                s = self._require_session()
-            except PermissionError:
-                self._json(401, {"error": "unauthorized"})
-                return
-            return self._ollama_stream("POST", "/api/generate", s)
-
-        if path == "/ollama/embeddings":
-            try:
-                _ = self._require_session()
-            except PermissionError:
-                self._json(401, {"error": "unauthorized"})
-                return
-            return self._ollama_simple_proxy("POST", "/api/embeddings")
-
-        self._json(404, {"error": "not_found"})
-
-    def _ollama_simple(self, method: str, api_path: str) -> None:
-        try:
-            _ = self._require_session()
-        except PermissionError:
-            self._json(401, {"error": "unauthorized"})
-            return
-
-        if (method, api_path) not in ALLOWED_OLLAMA:
-            self._json(403, {"error": "forbidden"})
-            return
-
-        host, port, _ = self.server.ollama_base
-        try:
-            conn = http.client.HTTPConnection(host, port, timeout=15)
-            conn.request(method, api_path, headers={"User-Agent": USER_AGENT})
-            resp = conn.getresponse()
-            data = resp.read()
-            ctype = resp.getheader("Content-Type") or "application/json; charset=utf-8"
-            self.send_response(resp.status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            for k, v in self._headers_common().items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception:
-            self._json(502, {"error": "ollama_unreachable"})
-
-    def _ollama_simple_proxy(self, method: str, api_path: str) -> None:
-        if (method, api_path) not in ALLOWED_OLLAMA:
-            self._json(403, {"error": "forbidden"})
-            return
-
-        try:
-            body = self._read_body()
-        except ValueError as e:
-            self._json(413, {"error": str(e)})
-            return
-
-        host, port, _ = self.server.ollama_base
-        try:
-            conn = http.client.HTTPConnection(host, port, timeout=60)
-            conn.request(method, api_path, body=body, headers={
-                "Content-Type": self.headers.get("Content-Type", "application/json"),
-                "User-Agent": USER_AGENT,
-            })
-            resp = conn.getresponse()
-            data = resp.read()
-            ctype = resp.getheader("Content-Type") or "application/json; charset=utf-8"
-            self.send_response(resp.status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            for k, v in self._headers_common().items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception:
-            self._json(502, {"error": "ollama_unreachable"})
-
-    def _ollama_stream(self, method: str, api_path: str, session_row: sqlite3.Row) -> None:
-        if (method, api_path) not in ALLOWED_OLLAMA:
-            self._json(403, {"error": "forbidden"})
-            return
-
-        try:
-            body = self._read_body()
-        except ValueError as e:
-            self._json(413, {"error": str(e)})
-            return
-
-        username = str(session_row["username"])
-        log_proxy(username, api_path, len(body))
-
-        host, port, _ = self.server.ollama_base
-        try:
-            conn = http.client.HTTPConnection(host, port, timeout=3600)
-            conn.request(method, api_path, body=body, headers={
-                "Content-Type": self.headers.get("Content-Type", "application/json"),
-                "User-Agent": USER_AGENT,
-            })
-            resp = conn.getresponse()
-            status = resp.status
-            ctype = resp.getheader("Content-Type") or "application/x-ndjson; charset=utf-8"
-
-            self._start_chunked(status, ctype, extra={"Connection": "close"})
-
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                self._write_chunk(chunk)
-
-            self._end_chunked()
-
-        except Exception:
-            try:
-                self._start_chunked(502, "application/x-ndjson; charset=utf-8", extra={"Connection": "close"})
-                self._write_chunk(b'{"error":"ollama_unreachable"}\n')
-                self._end_chunked()
-            except Exception:
-                pass
-
-    def log_message(self, fmt, *args):
-        return
-
-
-# ==========================
-# Main
-# ==========================
-
-def main():
-    ap = argparse.ArgumentParser(description="UPnP-exposed Ollama portal (mobile-first UI, auth, streaming proxy).")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="0.0.0.0", help="Bind address (default 0.0.0.0)")
-    ap.add_argument("--local-port", type=int, default=0, help="Local port (0=auto)")
-    ap.add_argument("--external-port", type=int, default=0, help="External port for UPnP (0=random high)")
-    ap.add_argument("--lease", type=int, default=0, help="UPnP lease duration seconds (0=router default/indefinite)")
-    ap.add_argument("--desc", default="python-ollama-portal", help="UPnP port mapping description")
-    ap.add_argument("--db", default="ollama_portal.sqlite", help="SQLite db path for users/sessions")
-    ap.add_argument("--ollama", default="http://127.0.0.1:11434", help="Ollama base URL (http only)")
-    ap.add_argument("--max-body", type=int, default=DEFAULT_MAX_BODY, help="Max request body size bytes")
-    ap.add_argument("--no-upnp", action="store_true", help="Disable UPnP mapping (LAN only)")
+    ap.add_argument("--port", type=int, default=0, help="Local port (0=random)")
+    ap.add_argument("--upnp", action="store_true", help="Enable UPnP IGD mapping (REQUIRED for public forwarding)")
+    ap.add_argument("--lease", type=int, default=0, help="UPnP lease duration seconds (0=router default)")
+    ap.add_argument("--desc", default="ollama-mobile-chat", help="UPnP port mapping description")
     args = ap.parse_args()
 
-    conn = db_connect(args.db)
-    ollama_base = parse_ollama_base(args.ollama)
+    app = make_app()
+    runner, site, bound_port = await start_aiohttp(app, args.bind, args.port)
 
     local_ip = get_local_ip()
-    local_port = args.local_port or pick_free_port(args.bind)
-
-    httpd = AppServer((args.bind, local_port), Handler, conn, ollama_base, args.max_body)
-
-    print(f"[{now_human()}] Local URL: http://127.0.0.1:{local_port}/")
-    print(f"[{now_human()}] Bind: {args.bind}:{local_port}  (LAN IP: {local_ip})")
-    print(f"[{now_human()}] Ollama upstream: {ollama_base[0]}:{ollama_base[1]} (http)")
-    print(f"[{now_human()}] DB: {args.db}")
+    print(f"[{_now()}] Local bind: {args.bind}:{bound_port}")
+    print(f"[{_now()}] Local URL:  http://127.0.0.1:{bound_port}/")
+    print(f"[{_now()}] LAN URL:    http://{local_ip}:{bound_port}/")
+    print(f"[{_now()}] Ollama:      {OLLAMA_BASE}")
 
     mapped = False
     control_url = None
     service_type = None
-    external_port = args.external_port or random.randint(20000, 60000)
-    ext_ip = None
+    external_ip = None
+    external_port = None
 
-    def cleanup():
-        nonlocal mapped
-        if mapped and control_url and service_type:
-            try:
-                delete_port_mapping(control_url, service_type, external_port)
-                print(f"[{now_human()}] Cleaned up UPnP mapping {external_port}/TCP")
-            except Exception as e:
-                print(f"[{now_human()}] WARNING: Failed to delete port mapping: {e}")
+    if args.upnp:
+        print(f"[{_now()}] UPnP: discovering IGD and creating random port mapping...")
+        external_ip, external_port, control_url, service_type = await upnp_map_random(
+            local_ip=local_ip,
+            local_port=bound_port,
+            desc=args.desc,
+            lease=args.lease,
+            retries=18,
+        )
+        if external_port:
+            mapped = True
+            print(f"[{_now()}] UPnP: mapping OK -> {external_port}/TCP -> {local_ip}:{bound_port}")
+            if external_ip:
+                print(f"[{_now()}] PUBLIC URL: http://{external_ip}:{external_port}/")
+            else:
+                print(f"[{_now()}] PUBLIC PORT: {external_port} (external IP unavailable from IGD)")
+        else:
+            print(f"[{_now()}] UPnP: FAILED to create mapping (UPnP disabled / unsupported / blocked / CGNAT?)")
 
-    atexit.register(cleanup)
-
-    if not args.no_upnp:
-        try:
-            location = ssdp_discover(timeout=3.0)
-            if not location:
-                raise RuntimeError("Could not discover UPnP IGD (SSDP). Is UPnP enabled on your router?")
-            control_url, service_type = find_igd_control_url(location)
-            if not control_url:
-                raise RuntimeError("Found device description but no WANIPConnection/WANPPPConnection control URL.")
-
-            for _ in range(8):
-                try:
-                    add_port_mapping(control_url, service_type, external_port, local_ip, local_port, args.desc, args.lease)
-                    mapped = True
-                    break
-                except Exception:
-                    external_port = random.randint(20000, 60000)
-
-            if not mapped:
-                raise RuntimeError("Unable to create UPnP port mapping after multiple attempts.")
-
-            ext_ip = get_external_ip(control_url, service_type) or "UNKNOWN_PUBLIC_IP"
-            print(f"[{now_human()}] UPnP mapping OK: http://{ext_ip}:{external_port}/")
-            print(f"[{now_human()}] Login required. (Token stored in browser localStorage after login.)")
-
-        except Exception as e:
-            print(f"[{now_human()}] WARNING: UPnP failed: {e}")
-            print(f"[{now_human()}] Server is LAN-only unless you manually forward the port.")
-
+    # Keep running until cancelled
     try:
-        httpd.serve_forever()
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
     except KeyboardInterrupt:
-        print(f"\n[{now_human()}] Shutting down…")
+        pass
     finally:
-        httpd.server_close()
+        if mapped and control_url and service_type and external_port:
+            print(f"[{_now()}] UPnP: removing mapping {external_port}/TCP ...")
+            await upnp_unmap(control_url, service_type, external_port)
+        await runner.cleanup()
 
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
